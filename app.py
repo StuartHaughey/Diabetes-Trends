@@ -289,7 +289,7 @@ if have_sg and len(monthly):
         st.info("No valid monthly data to plot.")
     else:
         order = mplot["month_str"].tolist()
-        subtitle = "Last 12 months" if analysis_mode.startswith("Last 12") else "All data"
+        subtitle = window_label
         tir_chart = (
             alt.Chart(mplot).mark_line(point=True)
             .encode(
