@@ -1,7 +1,5 @@
 # app.py — Diabetes Trends (CareLink CSV/TSV uploads)
-# Adds colour-coded tables with a Benchmark toggle:
-#   - Best practice (default): ADA/EASD/ISPAD targets
-#   - Personal baseline: compares months to your own average (±5pp band)
+# Adds: index hidden on tables, auto height (no inner scroll), month/hour shown, colour rules & benchmarks.
 
 import io
 import os
@@ -15,6 +13,14 @@ st.set_page_config(page_title="Diabetes Trends", layout="wide")
 st.title("📊 Diabetes Trends (CareLink CSV/TSV uploads)")
 
 STORE_PATH = "data_store.csv.gz"
+
+# ----------------------------
+# Small UI helpers
+# ----------------------------
+def df_auto_height(df: pd.DataFrame, row_px: int = 33, header_px: int = 42, max_px: int = 1800) -> int:
+    """Compute a height large enough to show all rows without inner scroll."""
+    # +1 for header; clamp to avoid absurdly tall tables
+    return min(max_px, header_px + row_px * (len(df) + 1))
 
 # ----------------------------
 # Persistence helpers
@@ -216,12 +222,10 @@ BEST_PRACTICE = {
     "Time Above Range % (>13.9)": ("lte", 5),
     "Time Below Range % (3.0–3.9)": ("lte", 4),
     "Time Below Range % (<3.0)": ("lte", 1),
-    # Optional soft band for mean SG: show green if ~6–8 mmol/L
     "Mean SG (mmol/L)": ("between", (6.0, 8.0)),
 }
 
 def personal_thresholds(df: pd.DataFrame, band_pp: int = 5):
-    """Build relative thresholds around your own average (±band)."""
     thr = {}
     if "Time in Range % (3.9–10)" in df.columns:
         base = df["Time in Range % (3.9–10)"].mean()
@@ -231,7 +235,6 @@ def personal_thresholds(df: pd.DataFrame, band_pp: int = 5):
         if col in df.columns:
             base = df[col].mean()
             thr[col] = ("lte", max(base - band_pp, 0))
-    # Mean SG: prefer lower than baseline by 0.2 mmol/L
     if "Mean SG (mmol/L)" in df.columns:
         base = df["Mean SG (mmol/L)"].mean()
         thr["Mean SG (mmol/L)"] = ("lte", base - 0.2)
@@ -243,10 +246,7 @@ AMBER = "background-color:#fff2cc;color:#7f6000"
 CLEAR = ""
 
 def style_by_rules(df: pd.DataFrame, mode: str):
-    if mode.startswith("Best"):
-        rules = BEST_PRACTICE
-    else:
-        rules = personal_thresholds(df, personal_band)
+    rules = BEST_PRACTICE if mode.startswith("Best") else personal_thresholds(df, personal_band)
 
     def cell_style(val, col):
         if pd.isna(val): return CLEAR
@@ -254,24 +254,22 @@ def style_by_rules(df: pd.DataFrame, mode: str):
         if not rule: return CLEAR
         kind, target = rule
         if kind == "gte":
-            # green if >= target, amber if close (target-5), red if below
             if val >= target: return GREEN
             if val >= max(target-5, 0): return AMBER
             return RED
         if kind == "lte":
-            # green if <= target, amber if within +5, red if worse
             if val <= target: return GREEN
             if val <= target + 5: return AMBER
             return RED
         if kind == "between":
             lo, hi = target
             if lo <= val <= hi: return GREEN
-            # amber if within 0.5 mmol/L band
             if (lo-0.5) <= val <= (hi+0.5): return AMBER
             return RED
         return CLEAR
 
-    return df.style.apply(lambda s: [cell_style(v, s.name) for v in s], axis=0)
+    # Hide the index (left numbering); keep Month column visible
+    return df.style.apply(lambda s: [cell_style(v, s.name) for v in s], axis=0).hide(axis="index")
 
 # ----------------------------
 # Monthly charts (Altair)
@@ -311,12 +309,21 @@ if have_sg and len(monthly):
         st.altair_chart(mean_chart, use_container_width=True)
 
 # ----------------------------
-# Monthly table (rounded + coloured)
+# Monthly table (rounded, coloured, no index, full height)
 # ----------------------------
 monthly_display = monthly.copy()
 monthly_display["month"] = monthly_display["month"].dt.strftime("%b-%Y")
 monthly_display = monthly_display.round(2)
-st.dataframe(style_by_rules(monthly_display, benchmark_mode), use_container_width=True)
+
+# Ensure Month is first column
+cols = ["month"] + [c for c in monthly_display.columns if c != "month"]
+monthly_display = monthly_display[cols]
+
+st.dataframe(
+    style_by_rules(monthly_display, benchmark_mode),
+    use_container_width=True,
+    height=df_auto_height(monthly_display)
+)
 
 csv_bytes = monthly_display.to_csv(index=False).encode("utf-8")
 st.download_button("Download monthly metrics (CSV)", data=csv_bytes,
@@ -325,7 +332,7 @@ st.download_button("Download monthly metrics (CSV)", data=csv_bytes,
 st.divider()
 
 # ----------------------------
-# Hour-of-day pattern (with colours)
+# Hour-of-day pattern (with colours; no index; full height)
 # ----------------------------
 st.subheader("Hour-of-day pattern (combined)")
 if have_sg:
@@ -340,9 +347,13 @@ if have_sg:
             "Samples": ("SG","count"),
         }
     ).reset_index()
+
     hourly = hourly.round(2)
 
-    # Simple colouring for hourly (best-practice-like)
+    GREEN = "background-color:#c6efce;color:#006100"
+    RED   = "background-color:#ffc7ce;color:#9c0006"
+    AMBER = "background-color:#fff2cc;color:#7f6000"
+
     def style_hourly(df):
         def color(val, col):
             if pd.isna(val): return ""
@@ -355,17 +366,22 @@ if have_sg:
                 if val <= 6: return AMBER
                 return RED
             if "Hyper" in col:
-                if ">13.9" in col:
-                    thr = 5
-                else:
-                    thr = 25
+                thr = 5 if ">13.9" in col else 25
                 if val <= thr: return GREEN
                 if val <= thr + 5: return AMBER
                 return RED
             return ""
-        return df.style.apply(lambda s: [color(v, s.name) for v in s], axis=0)
+        return df.style.apply(lambda s: [color(v, s.name) for v in s], axis=0).hide(axis="index")
 
-    st.dataframe(style_hourly(hourly), use_container_width=True)
+    # Ensure Hour is first column
+    cols = ["hour"] + [c for c in hourly.columns if c != "hour"]
+    hourly = hourly[cols]
+
+    st.dataframe(
+        style_hourly(hourly),
+        use_container_width=True,
+        height=df_auto_height(hourly)
+    )
 else:
     st.info("Upload files with CGM values to see hourly patterns.")
 
