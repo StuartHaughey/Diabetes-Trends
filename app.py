@@ -1,13 +1,8 @@
 # app.py — Diabetes Trends (CareLink CSV/TSV uploads)
-# Fixes:
-# - Monthly TIR plot uses DATA_START..today (no hard-coded 2025+)
-# - Hide index cleanly; Month/Hour first; optional Samples toggle
-# - Drop stray columns (index/level_0/Unnamed)
-# - 2dp formatting, colour rules, persistence preserved
+# Fix: standardise monthly column names (TIR %, TAR %, TBR %) and plot TIR reliably.
+# Keeps: 2dp, colouring, hidden index, Month/Hour first, no inner scroll, persistence.
 
-import io
-import os
-import re
+import io, os, re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -19,22 +14,16 @@ st.title("📊 Diabetes Trends (CareLink CSV/TSV uploads)")
 STORE_PATH = "data_store.csv.gz"
 DATA_START = pd.Timestamp("2024-01-01")  # fence the analysis window
 
-# ----------------------------
-# Small UI helpers
-# ----------------------------
+# ---------- helpers ----------
 def df_auto_height(df: pd.DataFrame, row_px: int = 33, header_px: int = 42, max_px: int = 1800) -> int:
     return min(max_px, header_px + row_px * (len(df) + 1))
 
-# ----------------------------
-# Persistence helpers
-# ----------------------------
 def store_exists() -> bool:
     return os.path.exists(STORE_PATH) and os.path.getsize(STORE_PATH) > 0
 
 @st.cache_data(show_spinner=False)
 def load_store(path: str = STORE_PATH) -> pd.DataFrame | None:
-    if not os.path.exists(path):
-        return None
+    if not os.path.exists(path): return None
     try:
         df = pd.read_csv(path, compression="gzip")
         if "dt" in df.columns:
@@ -45,24 +34,17 @@ def load_store(path: str = STORE_PATH) -> pd.DataFrame | None:
         return None
 
 def save_store(df: pd.DataFrame, path: str = STORE_PATH) -> None:
-    keep_cols = [c for c in df.columns if c in {
-        "Date","Time","SG","BG","Bolus","Carbs","Bolus Source","dt","month","source_file"
-    }]
-    slim = df[keep_cols].copy()
-    if "month" in slim.columns:
-        slim["month"] = slim["month"].astype(str)
+    keep = [c for c in df.columns if c in {"Date","Time","SG","BG","Bolus","Carbs","Bolus Source","dt","month","source_file"}]
+    slim = df[keep].copy()
+    if "month" in slim.columns: slim["month"] = slim["month"].astype(str)
     slim.to_csv(path, index=False, compression="gzip")
 
-# ----------------------------
-# Robust CareLink parser
-# ----------------------------
+# ---------- parsing ----------
 @st.cache_data
 def parse_file(file) -> pd.DataFrame:
     raw = file.read(); file.seek(0)
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        text = raw.decode("latin-1", errors="ignore")
+    try: text = raw.decode("utf-8")
+    except UnicodeDecodeError: text = raw.decode("latin-1", errors="ignore")
     text = text.replace("\r\n","\n").replace("\r","\n")
     lines = text.split("\n")
 
@@ -71,21 +53,19 @@ def parse_file(file) -> pd.DataFrame:
         s = line.strip("\ufeff ").strip()
         if ("Date" in s and "Time" in s) or re.search(r"\bIndex\b", s):
             header_idx = i; break
-    if header_idx is None:
-        raise ValueError("Could not locate header line with Date/Time.")
+    if header_idx is None: raise ValueError("Could not locate header line with Date/Time.")
 
     header_line = lines[header_idx]
     delim = max([",","\t",";"], key=lambda d: len(header_line.split(d)))
     body = "\n".join(lines[header_idx:])
-    df = pd.read_csv(io.StringIO(body), sep=delim, engine="python",
-                     skip_blank_lines=True, on_bad_lines="skip")
+    df = pd.read_csv(io.StringIO(body), sep=delim, engine="python", skip_blank_lines=True, on_bad_lines="skip")
 
-    # Drop junk columns up front
+    # drop junk cols
     df = df.loc[:, ~df.columns.astype(str).str.match(r"Unnamed")].copy()
-    for junk in ["index", "level_0", "Unnamed: 0"]:
-        if junk in df.columns: df = df.drop(columns=[junk])
+    for junk in ("index","level_0","Unnamed: 0"):
+        if junk in df.columns: df.drop(columns=[junk], inplace=True)
 
-    # Normalise common numeric columns if present
+    # normalise numeric columns if present
     colmap = {
         "Sensor Glucose (mmol/L)": "SG",
         "BG Reading (mmol/L)": "BG",
@@ -93,21 +73,16 @@ def parse_file(file) -> pd.DataFrame:
         "BWZ Carb Input (grams)": "Carbs",
     }
     for src, dst in colmap.items():
-        if src in df.columns:
-            df[dst] = pd.to_numeric(df[src], errors="coerce")
+        if src in df.columns: df[dst] = pd.to_numeric(df[src], errors="coerce")
 
-    # Build datetime columns
     if "Date" in df.columns and "Time" in df.columns:
-        df["dt"] = pd.to_datetime(df["Date"].astype(str)+" "+df["Time"].astype(str),
-                                  errors="coerce", dayfirst=True)
+        df["dt"] = pd.to_datetime(df["Date"].astype(str)+" "+df["Time"].astype(str), errors="coerce", dayfirst=True)
         df["month"] = df["dt"].dt.to_period("M")
 
     df["source_file"] = getattr(file, "name", "uploaded_file")
     return df
 
-# ----------------------------
-# Sidebar controls
-# ----------------------------
+# ---------- sidebar ----------
 st.sidebar.header("Data")
 stored = load_store() if store_exists() else None
 use_stored = False
@@ -122,18 +97,11 @@ if st.sidebar.button("Clear stored dataset"):
         st.error(f"Couldn’t clear store: {e}")
 
 st.sidebar.header("Benchmark")
-benchmark_mode = st.sidebar.radio(
-    "Colour-coding against:",
-    ["Best practice (guidelines)", "Personal baseline"],
-    index=0
-)
+benchmark_mode = st.sidebar.radio("Colour-coding against:", ["Best practice (guidelines)", "Personal baseline"], index=0)
 personal_band = st.sidebar.slider("Personal band (± percentage points)", 2, 10, 5)
-
 show_samples = st.sidebar.toggle("Show hourly 'Samples' column", value=False)
 
-# ----------------------------
-# Load data (uploads or stored)
-# ----------------------------
+# ---------- load data ----------
 if use_stored and stored is not None:
     data = stored.copy()
 else:
@@ -148,24 +116,19 @@ else:
         data = pd.concat(frames, ignore_index=True)
         st.success(f"Loaded {len(frames)} file(s) • {len(data):,} rows")
     elif stored is not None:
-        st.info("No uploads. Using stored dataset.")
-        data = stored.copy()
+        st.info("No uploads. Using stored dataset."); data = stored.copy()
     else:
-        st.info("Upload CSV/TSV files to begin.")
-        st.stop()
+        st.info("Upload CSV/TSV files to begin."); st.stop()
 
-# ----------------------------
-# Deduplicate + date fence
-# ----------------------------
+# dedupe + date fence
 if "dt" in data.columns:
     today = pd.Timestamp.today().normalize()
     data = data[(data["dt"] >= DATA_START) & (data["dt"] <= today)]
 
-# drop residual junk columns if any got in via store
-for junk in ["index", "level_0", "Unnamed: 0"]:
-    if junk in data.columns: data = data.drop(columns=[junk])
+for junk in ("index","level_0","Unnamed: 0"):
+    if junk in data.columns: data.drop(columns=[junk], inplace=True)
 
-sig_cols = [c for c in ["dt","SG","BG","Bolus","Carbs","source_file"] if c in data.columns]
+sig_cols = [c for c in ("dt","SG","BG","Bolus","Carbs","source_file") if c in data.columns]
 if sig_cols:
     data["_sig"] = data[sig_cols].astype(str).agg("|".join, axis=1).str.replace(r"\s+"," ", regex=True)
     data = data.drop_duplicates(subset="_sig").drop(columns="_sig")
@@ -178,9 +141,7 @@ if not use_stored and st.button("💾 Save as current dataset"):
 
 st.divider()
 
-# ----------------------------
-# Metrics
-# ----------------------------
+# ---------- metrics ----------
 sg = pd.to_numeric(data.get("SG"), errors="coerce")
 have_sg = sg.notna().sum() > 0
 c1,c2,c3,c4 = st.columns(4)
@@ -204,9 +165,7 @@ else:
 
 st.divider()
 
-# ----------------------------
-# Monthly summary
-# ----------------------------
+# ---------- monthly summary ----------
 data["date"]  = data["dt"].dt.date
 data["month"] = data["dt"].dt.to_period("M")
 
@@ -219,11 +178,11 @@ def monthly_summary(df):
     out = pd.DataFrame({
         "Mean SG (mmol/L)": g["SG"].mean(),
         "SD SG (mmol/L)": g["SG"].std(),
-        "Time in Range % (3.9–10)": g["SG"].apply(lambda s: pct_in_range(s,3.9,10)),
-        "Time Above Range % (10–13.9)": g["SG"].apply(lambda s: pct_in_range(s,10.01,13.9)),
-        "Time Above Range % (>13.9)": g["SG"].apply(lambda s: (pd.to_numeric(s, errors='coerce')>13.9).mean()*100 if s.notna().any() else np.nan),
-        "Time Below Range % (3.0–3.9)": g["SG"].apply(lambda s: pct_in_range(s,3.0,3.89)),
-        "Time Below Range % (<3.0)": g["SG"].apply(lambda s: (pd.to_numeric(s, errors='coerce')<3.0).mean()*100 if s.notna().any() else np.nan),
+        "TIR %": g["SG"].apply(lambda s: pct_in_range(s,3.9,10.0)),
+        "TAR % (10–13.9)": g["SG"].apply(lambda s: pct_in_range(s,10.01,13.9)),
+        "TAR % (>13.9)": g["SG"].apply(lambda s: (pd.to_numeric(s, errors='coerce')>13.9).mean()*100 if s.notna().any() else np.nan),
+        "TBR % (3.0–3.9)": g["SG"].apply(lambda s: pct_in_range(s,3.0,3.89)),
+        "TBR % (<3.0)": g["SG"].apply(lambda s: (pd.to_numeric(s, errors='coerce')<3.0).mean()*100 if s.notna().any() else np.nan),
         "Bolus Total (U)": g["Bolus"].sum() if "Bolus" in df.columns else np.nan,
         "Carbs Total (g)": g["Carbs"].sum() if "Carbs" in df.columns else np.nan,
     }).reset_index()
@@ -232,31 +191,24 @@ def monthly_summary(df):
 
 monthly = monthly_summary(data)
 
-# ----------------------------
-# Colour rules
-# ----------------------------
+# ---------- colour rules ----------
 BEST_PRACTICE = {
-    "Time in Range % (3.9–10)": ("gte", 70),
-    "Time Above Range % (10–13.9)": ("lte", 25),
-    "Time Above Range % (>13.9)": ("lte", 5),
-    "Time Below Range % (3.0–3.9)": ("lte", 4),
-    "Time Below Range % (<3.0)": ("lte", 1),
+    "TIR %": ("gte", 70),
+    "TAR % (10–13.9)": ("lte", 25),
+    "TAR % (>13.9)": ("lte", 5),
+    "TBR % (3.0–3.9)": ("lte", 4),
+    "TBR % (<3.0)": ("lte", 1),
     "Mean SG (mmol/L)": ("between", (6.0, 8.0)),
 }
-
 def personal_thresholds(df: pd.DataFrame, band_pp: int = 5):
     thr = {}
-    if "Time in Range % (3.9–10)" in df.columns:
-        base = df["Time in Range % (3.9–10)"].mean()
-        thr["Time in Range % (3.9–10)"] = ("gte", base + band_pp)
-    for col in ["Time Above Range % (10–13.9)","Time Above Range % (>13.9)",
-                "Time Below Range % (3.0–3.9)","Time Below Range % (<3.0)"]:
+    if "TIR %" in df.columns:
+        base = df["TIR %"].mean(); thr["TIR %"] = ("gte", base + band_pp)
+    for col in ["TAR % (10–13.9)","TAR % (>13.9)","TBR % (3.0–3.9)","TBR % (<3.0)"]:
         if col in df.columns:
-            base = df[col].mean()
-            thr[col] = ("lte", max(base - band_pp, 0))
+            base = df[col].mean(); thr[col] = ("lte", max(base - band_pp, 0))
     if "Mean SG (mmol/L)" in df.columns:
-        base = df["Mean SG (mmol/L)"].mean()
-        thr["Mean SG (mmol/L)"] = ("lte", base - 0.2)
+        base = df["Mean SG (mmol/L)"].mean(); thr["Mean SG (mmol/L)"] = ("lte", base - 0.2)
     return thr
 
 GREEN = "background-color:#c6efce;color:#006100"
@@ -266,7 +218,6 @@ CLEAR = ""
 
 def style_by_rules(df: pd.DataFrame, mode: str):
     rules = BEST_PRACTICE if mode.startswith("Best") else personal_thresholds(df, personal_band)
-
     def cell_style(val, col):
         if pd.isna(val): return CLEAR
         rule = rules.get(col)
@@ -286,20 +237,16 @@ def style_by_rules(df: pd.DataFrame, mode: str):
             if (lo-0.5) <= val <= (hi+0.5): return AMBER
             return RED
         return CLEAR
-
-    # return a Styler with colours + 2dp; we'll also hide index via st.dataframe(hide_index=True)
     return df.style.apply(lambda s: [cell_style(v, s.name) for v in s], axis=0).format(precision=2)
 
-# ----------------------------
-# Monthly charts (Altair)
-# ----------------------------
+# ---------- charts ----------
 st.subheader("Monthly Trends")
 if have_sg and len(monthly):
     mplot = monthly.copy()
     mplot["month_str"] = mplot["month"].dt.strftime("%b-%Y")
-    # Plot months within the same fence as the data
-    mplot = mplot[(mplot["month"].dt.to_timestamp() >= DATA_START)]
-    mplot = mplot.dropna(subset=["Time in Range % (3.9–10)"])
+    # use same fence as data; drop rows with missing TIR
+    mplot = mplot[mplot["month"].dt.to_timestamp() >= DATA_START]
+    mplot = mplot.dropna(subset=["TIR %"])
     if not len(mplot):
         st.info("No valid monthly data to plot.")
     else:
@@ -308,18 +255,15 @@ if have_sg and len(monthly):
             alt.Chart(mplot).mark_line(point=True)
             .encode(
                 x=alt.X("month_str:N", title="Month", sort=order),
-                y=alt.Y("Time in Range % (3.9–10):Q", title="Time in Range %",
-                        scale=alt.Scale(domain=[0,100])),
-                tooltip=[alt.Tooltip("month_str:N", title="Month"),
-                         alt.Tooltip("Time in Range % (3.9–10):Q", format=".2f")]
+                y=alt.Y("TIR %:Q", title="Time in Range %", scale=alt.Scale(domain=[0,100])),
+                tooltip=[alt.Tooltip("month_str:N", title="Month"), alt.Tooltip("TIR %:Q", format=".2f")]
             ).properties(height=260, title="Time in Range by Month")
         )
         mean_chart = (
             alt.Chart(mplot).mark_line(point=True)
             .encode(
                 x=alt.X("month_str:N", title="Month", sort=order),
-                y=alt.Y("Mean SG (mmol/L):Q", title="Mean SG (mmol/L)",
-                        scale=alt.Scale(domain=[3,15])),
+                y=alt.Y("Mean SG (mmol/L):Q", title="Mean SG (mmol/L)", scale=alt.Scale(domain=[3,15])),
                 tooltip=[alt.Tooltip("month_str:N", title="Month"),
                          alt.Tooltip("Mean SG (mmol/L):Q", format=".2f"),
                          alt.Tooltip("GMI %:Q", title="GMI %", format=".2f")]
@@ -328,18 +272,17 @@ if have_sg and len(monthly):
         st.altair_chart(tir_chart, use_container_width=True)
         st.altair_chart(mean_chart, use_container_width=True)
 
-# ----------------------------
-# Monthly table (2dp, coloured, Month first, no index)
-# ----------------------------
+# ---------- monthly table ----------
 monthly_display = monthly.copy()
 monthly_display["month"] = monthly_display["month"].dt.strftime("%b-%Y")
 monthly_display = monthly_display.round(2)
 
-# Ensure Month is first, and push totals to the end so “counts” aren’t first
+# Month first; totals last
 tail_cols = [c for c in ["Bolus Total (U)","Carbs Total (g)"] if c in monthly_display.columns]
-main_cols = [c for c in monthly_display.columns if c not in (["month"] + tail_cols)]
-cols = ["month"] + main_cols[1:] + tail_cols  # keep month, then metrics, then totals
-monthly_display = monthly_display[cols]
+ordered = ["month","TIR %","TAR % (10–13.9)","TAR % (>13.9)","TBR % (3.0–3.9)","TBR % (<3.0)",
+           "Mean SG (mmol/L)","SD SG (mmol/L)"] + tail_cols
+ordered = [c for c in ordered if c in monthly_display.columns]
+monthly_display = monthly_display[ordered]
 
 st.dataframe(
     style_by_rules(monthly_display, benchmark_mode),
@@ -354,9 +297,7 @@ st.download_button("Download monthly metrics (CSV)", data=csv_bytes,
 
 st.divider()
 
-# ----------------------------
-# Hour-of-day pattern (2dp, colours; Hour first; optional Samples; no index)
-# ----------------------------
+# ---------- hourly pattern ----------
 st.subheader("Hour-of-day pattern (combined)")
 if have_sg:
     tmp = data[["dt","SG"]].dropna().copy()
@@ -370,7 +311,6 @@ if have_sg:
             "Samples": ("SG","count"),
         }
     ).reset_index()
-
     hourly = hourly.round(2)
 
     GREEN = "background-color:#c6efce;color:#006100"
@@ -396,9 +336,7 @@ if have_sg:
             return ""
         return df.style.apply(lambda s: [color(v, s.name) for v in s], axis=0).format(precision=2)
 
-    # Build column order (Hour first, Samples last or hidden)
-    metric_cols = ["Time in Range %","Hyper % (>10)","Severe Hyper % (>13.9)","Hypo % (<3.9)"]
-    cols = ["hour"] + metric_cols + (["Samples"] if show_samples else [])
+    cols = ["hour","Time in Range %","Hyper % (>10)","Severe Hyper % (>13.9)","Hypo % (<3.9)"] + (["Samples"] if show_samples else [])
     hourly = hourly[cols]
 
     st.dataframe(
