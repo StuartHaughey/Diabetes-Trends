@@ -1,14 +1,49 @@
-# app.py — Diabetes Trends (CareLink CSV/TSV uploads)
+# app.py — Diabetes Trends (CareLink CSV/TSV uploads) with simple persistence
 # Drop this whole file into your repo and redeploy on Streamlit Cloud.
 
 import io
+import os
 import re
 import numpy as np
 import pandas as pd
 import streamlit as st
+from datetime import datetime
 
 st.set_page_config(page_title="Diabetes Trends", layout="wide")
 st.title("📊 Diabetes Trends (CareLink CSV/TSV uploads)")
+
+STORE_PATH = "data_store.csv.gz"  # persisted current dataset (parsed & normalised)
+
+# ----------------------------
+# Helpers: load/save store
+# ----------------------------
+def store_exists() -> bool:
+    return os.path.exists(STORE_PATH) and os.path.getsize(STORE_PATH) > 0
+
+@st.cache_data(show_spinner=False)
+def load_store(path: str = STORE_PATH) -> pd.DataFrame | None:
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path, compression="gzip")
+        # Rebuild datetime/period columns
+        if "dt" in df.columns:
+            df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
+            df["month"] = df["dt"].dt.to_period("M")
+        return df
+    except Exception:
+        return None
+
+def save_store(df: pd.DataFrame, path: str = STORE_PATH) -> None:
+    # Keep only relevant columns to keep the file tidy
+    keep_cols = [c for c in df.columns if c in {
+        "Date","Time","SG","BG","Bolus","Carbs","Bolus Source","dt","month","source_file"
+    }]
+    slim = df[keep_cols].copy()
+    # month to string for CSV; will be rebuilt on load
+    if "month" in slim.columns:
+        slim["month"] = slim["month"].astype(str)
+    slim.to_csv(path, index=False, compression="gzip")
 
 # ----------------------------
 # Robust CareLink file parser
@@ -87,43 +122,96 @@ def parse_file(file) -> pd.DataFrame:
 
     return df
 
+# ----------------------------
+# Sidebar: choose data source
+# ----------------------------
+st.sidebar.header("Data source")
+stored = load_store() if store_exists() else None
+use_stored = False
+
+if stored is not None:
+    st.sidebar.success(f"Stored dataset found: {len(stored):,} rows")
+    use_stored = st.sidebar.toggle("Use stored dataset (ignore new uploads)", value=True)
+
+clr1, clr2 = st.sidebar.columns(2)
+with clr1:
+    if st.button("Clear stored dataset", help="Deletes the server-side CSV so the app stops auto-loading old data."):
+        try:
+            if store_exists():
+                os.remove(STORE_PATH)
+            st.success("Stored dataset cleared. Reload the page.")
+        except Exception as e:
+            st.error(f"Couldn’t clear store: {e}")
 
 # ----------------------------
-# File upload + parsing
+# File upload + parsing (if not using stored)
 # ----------------------------
-uploaded_files = st.file_uploader(
-    "Upload one or more CareLink CSV/TSV exports (monthly or weekly).",
-    type=["csv", "tsv"],
-    accept_multiple_files=True
-)
+data = None
 
-if not uploaded_files:
-    st.info("Upload CSV/TSV files to begin.")
-    st.stop()
+if use_stored and stored is not None:
+    data = stored.copy()
+else:
+    uploaded_files = st.file_uploader(
+        "Upload one or more CareLink CSV/TSV exports (monthly or weekly).",
+        type=["csv", "tsv"],
+        accept_multiple_files=True
+    )
 
-frames, bad = [], []
-for f in uploaded_files:
-    try:
-        frames.append(parse_file(f))
-    except Exception:
-        bad.append(f.name)
+    frames, bad = [], []
+    if uploaded_files:
+        for f in uploaded_files:
+            try:
+                frames.append(parse_file(f))
+            except Exception:
+                bad.append(f.name)
 
-if bad:
-    st.warning("Skipped files that failed to parse: " + ", ".join(bad))
+    if bad:
+        st.warning("Skipped files that failed to parse: " + ", ".join(bad))
 
-if not frames:
-    st.error("No valid files parsed. Please check your exports.")
-    st.stop()
+    if frames:
+        data = pd.concat(frames, ignore_index=True)
+        st.success(f"Loaded {len(frames)} file(s) • {len(data):,} rows")
+    elif stored is not None:
+        st.info("No files uploaded. Falling back to stored dataset.")
+        data = stored.copy()
+    else:
+        st.info("Upload CSV/TSV files to begin, or save a dataset once to enable stored mode.")
+        st.stop()
 
-data = pd.concat(frames, ignore_index=True)
-st.success(f"Loaded {len(frames)} file(s) • {len(data):,} rows")
+# ----------------------------
+# Deduplicate (safe to merge months over time)
+# ----------------------------
+# Create a simple signature per row to avoid doubles when you add more months
+sig_cols = []
+for c in ["dt","SG","BG","Bolus","Carbs","source_file"]:
+    if c in data.columns:
+        sig_cols.append(c)
+
+if sig_cols:
+    data["_sig"] = (
+        data[sig_cols]
+        .astype(str)
+        .agg("|".join, axis=1)
+        .str.replace(r"\s+", " ", regex=True)
+    )
+    data = data.drop_duplicates(subset="_sig").drop(columns="_sig")
 
 # ----------------------------
 # Guardrails: confirm essentials
 # ----------------------------
 if "dt" not in data.columns or data["dt"].isna().all():
-    st.error("Couldn’t detect Date/Time in the uploads. Please ensure the export includes 'Date' and 'Time' columns.")
+    st.error("Couldn’t detect Date/Time in the dataset. Ensure the export includes 'Date' and 'Time'.")
     st.stop()
+
+# ----------------------------
+# Save control (only shows if we built a dataset from uploads)
+# ----------------------------
+if not use_stored and data is not None:
+    if st.button("💾 Save as current dataset", help="Persist the parsed data so mobile can load it without re-uploading."):
+        save_store(data)
+        st.success("Saved. Mobile can now load this dataset without uploading.")
+
+st.divider()
 
 # ----------------------------
 # Core metrics (overall)
@@ -144,10 +232,9 @@ if have_sg:
 else:
     with col1: st.info("No CGM (SG) values detected.")
 
-# Auto-correction % (MiniMed 780G) using Bolus Source and carb entries
+# Auto-correction % (MiniMed 780G) using Bolus Source
 if "Bolus" in data.columns:
     total_bolus = pd.to_numeric(data["Bolus"], errors="coerce").fillna(0)
-    # Identify auto-corrections via Bolus Source flag
     src = data.get("Bolus Source", pd.Series("", index=data.index)).astype(str).str.upper()
     auto_units = total_bolus.where(src.str.contains("AUTO_INSULIN"), 0).sum()
     autocorr_pct = (auto_units / total_bolus.sum() * 100) if total_bolus.sum() else np.nan
@@ -188,28 +275,28 @@ def monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 monthly = monthly_summary(data)
 
-# ---- Charts (use Period index for correct order) ----
 st.subheader("Monthly Trends")
 if have_sg:
     st.line_chart(monthly.set_index("month")[["Time in Range % (3.9–10)"]])
     st.line_chart(monthly.set_index("month")[["Mean SG (mmol/L)"]])
 
-# ---- Display table with pretty month labels & 2-dec rounding ----
+# Display table with nice month labels & 2-dec rounding
 monthly_display = monthly.copy()
 monthly_display["month"] = monthly_display["month"].dt.strftime("%b-%Y")
 monthly_display = monthly_display.round(2)
 st.dataframe(monthly_display, use_container_width=True)
 
-# Download button for computed monthly metrics (rounded to 2 decimals)
+# Download button for computed monthly metrics (rounded)
 csv_bytes = monthly_display.to_csv(index=False).encode("utf-8")
-st.download_button("Download monthly metrics (CSV)", data=csv_bytes, file_name="diabetes_monthly_metrics.csv", mime="text/csv")
+st.download_button("Download monthly metrics (CSV)", data=csv_bytes,
+                   file_name="diabetes_monthly_metrics.csv", mime="text/csv")
 
 st.divider()
 
 # ----------------------------
 # Hour-of-day pattern (quick view)
 # ----------------------------
-st.subheader("Hour-of-day pattern (combined uploads)")
+st.subheader("Hour-of-day pattern (combined)")
 if have_sg:
     tmp = data[["dt", "SG"]].dropna().copy()
     tmp["hour"] = tmp["dt"].dt.hour
@@ -226,3 +313,11 @@ if have_sg:
     st.dataframe(hourly, use_container_width=True)
 else:
     st.info("Upload files that include CGM (SG) values to see hourly patterns.")
+
+# ----------------------------
+# Footer note about persistence
+# ----------------------------
+st.caption(
+    "Tip: Upload on desktop, click “Save as current dataset”, then open this same URL on your phone. "
+    "The stored dataset persists across sessions; clearing it or redeploying the app will reset it."
+)
