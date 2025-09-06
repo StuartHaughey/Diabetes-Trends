@@ -171,21 +171,35 @@ def pct_in_range(x, lo, hi):
 def monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
     grp = df.groupby("month", dropna=True)
     out = pd.DataFrame({
-        "mean_SG_mmol/L": grp["SG"].mean(),
-        "sd_SG_mmol/L": grp["SG"].std(),
-        "TIR_% (3.9–10)": grp["SG"].apply(lambda s: pct_in_range(s, 3.9, 10.0)),
-        "TAR_% (10–13.9)": grp["SG"].apply(lambda s: pct_in_range(s, 10.01, 13.9)),
-        "TAR_% (>13.9)": grp["SG"].apply(lambda s: (pd.to_numeric(s, errors='coerce') > 13.9).mean()*100 if s.notna().any() else np.nan),
-        "TBR_% (3.0–3.9)": grp["SG"].apply(lambda s: pct_in_range(s, 3.0, 3.89)),
-        "TBR_% (<3.0)": grp["SG"].apply(lambda s: (pd.to_numeric(s, errors='coerce') < 3.0).mean()*100 if s.notna().any() else np.nan),
-        "Bolus_total_U": grp["Bolus"].sum() if "Bolus" in df.columns else np.nan,
-        "Carbs_total_g": grp["Carbs"].sum() if "Carbs" in df.columns else np.nan,
+        "Mean SG (mmol/L)": grp["SG"].mean(),
+        "SD SG (mmol/L)": grp["SG"].std(),
+        "Time in Range % (3.9–10)": grp["SG"].apply(lambda s: pct_in_range(s, 3.9, 10.0)),
+        "Time Above Range % (10–13.9)": grp["SG"].apply(lambda s: pct_in_range(s, 10.01, 13.9)),
+        "Time Above Range % (>13.9)": grp["SG"].apply(lambda s: (pd.to_numeric(s, errors='coerce') > 13.9).mean()*100 if s.notna().any() else np.nan),
+        "Time Below Range % (3.0–3.9)": grp["SG"].apply(lambda s: pct_in_range(s, 3.0, 3.89)),
+        "Time Below Range % (<3.0)": grp["SG"].apply(lambda s: (pd.to_numeric(s, errors='coerce') < 3.0).mean()*100 if s.notna().any() else np.nan),
+        "Bolus Total (U)": grp["Bolus"].sum() if "Bolus" in df.columns else np.nan,
+        "Carbs Total (g)": grp["Carbs"].sum() if "Carbs" in df.columns else np.nan,
     }).reset_index()
 
     # GMI from mean SG
-    out["GMI_%"] = 3.31 + 0.43056 * out["mean_SG_mmol/L"]
+    out["GMI %"] = 3.31 + 0.43056 * out["Mean SG (mmol/L)"]
     out = out.sort_values("month")
+    out = out.rename(columns={
+    "mean_SG_mmol/L": "Mean SG (mmol/L)",
+    "sd_SG_mmol/L": "SD SG (mmol/L)",
+    "TIR_% (3.9–10)": "Time in Range % (3.9–10)",
+    "TAR_% (10–13.9)": "Time Above Range % (10–13.9)",
+    "TAR_% (>13.9)": "Time Above Range % (>13.9)",
+    "TBR_% (3.0–3.9)": "Time Below Range % (3.0–3.9)",
+    "TBR_% (<3.0)": "Time Below Range % (<3.0)",
+    "Bolus_total_U": "Bolus Total (U)",
+    "Carbs_total_g": "Carbs Total (g)",
+    "GMI_%": "GMI %"
+})
+
     return out
+
 
 monthly = monthly_summary(data)
 monthly_display = monthly.copy()
@@ -215,12 +229,22 @@ if have_sg:
     tmp = data[["dt", "SG"]].dropna().copy()
     tmp["hour"] = tmp["dt"].dt.hour
     hourly = tmp.groupby("hour").agg(
-        TIR_pct=("SG", lambda s: ((s>=3.9)&(s<=10.0)).mean()*100),
-        Hyper_pct=("SG", lambda s: (s>10.0).mean()*100),
-        SevereHyper_pct=("SG", lambda s: (s>13.9).mean()*100),
-        Hypo_pct=("SG", lambda s: (s<3.9).mean()*100),
-        samples=("SG","count")
-    ).reset_index()
+    **{
+        "Time in Range %": ("SG", lambda s: ((s>=3.9)&(s<=10.0)).mean()*100),
+        "Hyper % (>10)": ("SG", lambda s: (s>10.0).mean()*100),
+        "Severe Hyper % (>13.9)": ("SG", lambda s: (s>13.9).mean()*100),
+        "Hypo % (<3.9)": ("SG", lambda s: (s<3.9).mean()*100),
+        "Samples": ("SG","count")
+    }
+).reset_index()
+hourly = hourly.rename(columns={
+    "TIR_pct": "Time in Range %",
+    "Hyper_pct": "Hyper % (>10)",
+    "SevereHyper_pct": "Severe Hyper % (>13.9)",
+    "Hypo_pct": "Hypo % (<3.9)",
+    "samples": "Samples"
+})
+
     hourly = hourly.round(2)
     st.dataframe(hourly, use_container_width=True)
 else:
