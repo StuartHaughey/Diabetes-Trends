@@ -1,4 +1,7 @@
-# app.py — Diabetes Trends (CareLink CSV/TSV uploads) with fixes for phantom months and NaN charts
+# app.py — Diabetes Trends (CareLink CSV/TSV uploads)
+# Adds colour-coded tables with a Benchmark toggle:
+#   - Best practice (default): ADA/EASD/ISPAD targets
+#   - Personal baseline: compares months to your own average (±5pp band)
 
 import io
 import os
@@ -7,7 +10,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
-from datetime import datetime
 
 st.set_page_config(page_title="Diabetes Trends", layout="wide")
 st.title("📊 Diabetes Trends (CareLink CSV/TSV uploads)")
@@ -15,7 +17,7 @@ st.title("📊 Diabetes Trends (CareLink CSV/TSV uploads)")
 STORE_PATH = "data_store.csv.gz"
 
 # ----------------------------
-# Helpers: load/save store
+# Persistence helpers
 # ----------------------------
 def store_exists() -> bool:
     return os.path.exists(STORE_PATH) and os.path.getsize(STORE_PATH) > 0
@@ -43,37 +45,31 @@ def save_store(df: pd.DataFrame, path: str = STORE_PATH) -> None:
     slim.to_csv(path, index=False, compression="gzip")
 
 # ----------------------------
-# Robust CareLink file parser
+# Robust CareLink parser
 # ----------------------------
 @st.cache_data
 def parse_file(file) -> pd.DataFrame:
-    raw_bytes = file.read()
-    file.seek(0)
-
+    raw = file.read(); file.seek(0)
     try:
-        text = raw_bytes.decode("utf-8")
+        text = raw.decode("utf-8")
     except UnicodeDecodeError:
-        text = raw_bytes.decode("latin-1", errors="ignore")
-
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = raw.decode("latin-1", errors="ignore")
+    text = text.replace("\r\n","\n").replace("\r","\n")
     lines = text.split("\n")
 
     header_idx = None
     for i, line in enumerate(lines[:300]):
         s = line.strip("\ufeff ").strip()
         if ("Date" in s and "Time" in s) or re.search(r"\bIndex\b", s):
-            header_idx = i
-            break
+            header_idx = i; break
     if header_idx is None:
-        raise ValueError("Could not locate a header line with Date/Time in this file.")
+        raise ValueError("Could not locate header line with Date/Time.")
 
     header_line = lines[header_idx]
-    delim = max([",", "\t", ";"], key=lambda d: len(header_line.split(d)))
-
+    delim = max([",","\t",";"], key=lambda d: len(header_line.split(d)))
     body = "\n".join(lines[header_idx:])
     df = pd.read_csv(io.StringIO(body), sep=delim, engine="python",
                      skip_blank_lines=True, on_bad_lines="skip")
-
     df = df.loc[:, ~df.columns.astype(str).str.match(r"Unnamed")].copy()
 
     colmap = {
@@ -87,7 +83,7 @@ def parse_file(file) -> pd.DataFrame:
             df[dst] = pd.to_numeric(df[src], errors="coerce")
 
     if "Date" in df.columns and "Time" in df.columns:
-        df["dt"] = pd.to_datetime(df["Date"].astype(str) + " " + df["Time"].astype(str),
+        df["dt"] = pd.to_datetime(df["Date"].astype(str)+" "+df["Time"].astype(str),
                                   errors="coerce", dayfirst=True)
         df["month"] = df["dt"].dt.to_period("M")
 
@@ -95,193 +91,232 @@ def parse_file(file) -> pd.DataFrame:
     return df
 
 # ----------------------------
-# Sidebar: choose data source
+# Sidebar controls
 # ----------------------------
-st.sidebar.header("Data source")
+st.sidebar.header("Data")
 stored = load_store() if store_exists() else None
 use_stored = False
-
 if stored is not None:
-    st.sidebar.success(f"Stored dataset found: {len(stored):,} rows")
+    st.sidebar.success(f"Stored dataset: {len(stored):,} rows")
     use_stored = st.sidebar.toggle("Use stored dataset", value=True)
-
 if st.sidebar.button("Clear stored dataset"):
     try:
-        if store_exists():
-            os.remove(STORE_PATH)
+        if store_exists(): os.remove(STORE_PATH)
         st.success("Stored dataset cleared. Reload the page.")
     except Exception as e:
         st.error(f"Couldn’t clear store: {e}")
 
-# ----------------------------
-# Load data
-# ----------------------------
-data = None
+st.sidebar.header("Benchmark")
+benchmark_mode = st.sidebar.radio(
+    "Colour-coding against:",
+    ["Best practice (guidelines)", "Personal baseline"],
+    index=0
+)
+personal_band = st.sidebar.slider("Personal band (± percentage points)", 2, 10, 5)
 
+# ----------------------------
+# Load data (uploads or stored)
+# ----------------------------
 if use_stored and stored is not None:
     data = stored.copy()
 else:
-    uploaded_files = st.file_uploader(
-        "Upload one or more CareLink CSV/TSV exports",
-        type=["csv", "tsv"],
-        accept_multiple_files=True
-    )
-
+    files = st.file_uploader("Upload CareLink CSV/TSV exports", type=["csv","tsv"], accept_multiple_files=True)
     frames, bad = [], []
-    if uploaded_files:
-        for f in uploaded_files:
-            try:
-                frames.append(parse_file(f))
-            except Exception:
-                bad.append(f.name)
-
-    if bad:
-        st.warning("Skipped files that failed to parse: " + ", ".join(bad))
-
+    if files:
+        for f in files:
+            try: frames.append(parse_file(f))
+            except Exception: bad.append(f.name)
+    if bad: st.warning("Skipped files: " + ", ".join(bad))
     if frames:
         data = pd.concat(frames, ignore_index=True)
         st.success(f"Loaded {len(frames)} file(s) • {len(data):,} rows")
     elif stored is not None:
-        st.info("No files uploaded. Falling back to stored dataset.")
+        st.info("No uploads. Using stored dataset.")
         data = stored.copy()
     else:
         st.info("Upload CSV/TSV files to begin.")
         st.stop()
 
-# ----------------------------
-# Deduplicate and filter future dates
-# ----------------------------
+# Deduplicate + drop future-dated rows
 if "dt" in data.columns:
-    today = pd.Timestamp.today().normalize()
-    data = data[data["dt"] <= today]
-
+    data = data[data["dt"] <= pd.Timestamp.today().normalize()]
 sig_cols = [c for c in ["dt","SG","BG","Bolus","Carbs","source_file"] if c in data.columns]
 if sig_cols:
-    data["_sig"] = data[sig_cols].astype(str).agg("|".join, axis=1).str.replace(r"\s+", " ", regex=True)
+    data["_sig"] = data[sig_cols].astype(str).agg("|".join, axis=1).str.replace(r"\s+"," ", regex=True)
     data = data.drop_duplicates(subset="_sig").drop(columns="_sig")
 
 if "dt" not in data.columns or data["dt"].isna().all():
-    st.error("Couldn’t detect Date/Time in the dataset.")
-    st.stop()
+    st.error("Couldn’t detect Date/Time in the dataset."); st.stop()
 
-if not use_stored and data is not None:
-    if st.button("💾 Save as current dataset"):
-        save_store(data)
-        st.success("Saved. Mobile can now load this dataset without uploading.")
+if not use_stored and st.button("💾 Save as current dataset"):
+    save_store(data); st.success("Saved. Mobile will load this dataset automatically.")
 
 st.divider()
 
 # ----------------------------
-# Core metrics
+# Metrics
 # ----------------------------
 sg = pd.to_numeric(data.get("SG"), errors="coerce")
 have_sg = sg.notna().sum() > 0
-
-col1, col2, col3, col4 = st.columns(4)
-
+c1,c2,c3,c4 = st.columns(4)
 if have_sg:
     mean_sg = sg.mean()
-    gmi = 3.31 + 0.43056 * mean_sg
-    tir = ((sg >= 3.9) & (sg <= 10.0)).mean() * 100
-    with col1: st.metric("Mean SG (mmol/L)", f"{mean_sg:.2f}")
-    with col2: st.metric("GMI (%)", f"{gmi:.2f}")
-    with col3: st.metric("Time in Range 3.9–10", f"{tir:.2f}%")
+    gmi = 3.31 + 0.43056*mean_sg
+    tir = ((sg>=3.9)&(sg<=10)).mean()*100
+    with c1: st.metric("Mean SG (mmol/L)", f"{mean_sg:.2f}")
+    with c2: st.metric("GMI (%)", f"{gmi:.2f}")
+    with c3: st.metric("Time in Range 3.9–10", f"{tir:.2f}%")
 else:
-    with col1: st.info("No CGM values detected.")
-
+    with c1: st.info("No CGM values detected.")
 if "Bolus" in data.columns:
     total_bolus = pd.to_numeric(data["Bolus"], errors="coerce").fillna(0)
     src = data.get("Bolus Source", pd.Series("", index=data.index)).astype(str).str.upper()
     auto_units = total_bolus.where(src.str.contains("AUTO_INSULIN"), 0).sum()
-    autocorr_pct = (auto_units / total_bolus.sum() * 100) if total_bolus.sum() else np.nan
-    with col4: st.metric("Auto-corrections (% bolus)", f"{autocorr_pct:.2f}%" if pd.notna(autocorr_pct) else "—")
+    ac_pct = (auto_units/total_bolus.sum()*100) if total_bolus.sum() else np.nan
+    with c4: st.metric("Auto-corrections (% bolus)", f"{ac_pct:.2f}%" if pd.notna(ac_pct) else "—")
 else:
-    with col4: st.info("No bolus data detected.")
+    with c4: st.info("No bolus data detected.")
 
 st.divider()
 
 # ----------------------------
-# Monthly trends
+# Monthly summary
 # ----------------------------
 data["date"]  = data["dt"].dt.date
 data["month"] = data["dt"].dt.to_period("M")
 
 def pct_in_range(x, lo, hi):
     x = pd.to_numeric(x, errors="coerce").dropna()
-    return ((x >= lo) & (x <= hi)).mean() * 100 if len(x) else np.nan
+    return ((x>=lo)&(x<=hi)).mean()*100 if len(x) else np.nan
 
-def monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
-    grp = df.groupby("month", dropna=True)
+def monthly_summary(df):
+    g = df.groupby("month", dropna=True)
     out = pd.DataFrame({
-        "Mean SG (mmol/L)": grp["SG"].mean(),
-        "SD SG (mmol/L)": grp["SG"].std(),
-        "Time in Range % (3.9–10)": grp["SG"].apply(lambda s: pct_in_range(s, 3.9, 10.0)),
-        "Time Above Range % (10–13.9)": grp["SG"].apply(lambda s: pct_in_range(s, 10.01, 13.9)),
-        "Time Above Range % (>13.9)": grp["SG"].apply(lambda s: (pd.to_numeric(s, errors='coerce') > 13.9).mean()*100 if s.notna().any() else np.nan),
-        "Time Below Range % (3.0–3.9)": grp["SG"].apply(lambda s: pct_in_range(s, 3.0, 3.89)),
-        "Time Below Range % (<3.0)": grp["SG"].apply(lambda s: (pd.to_numeric(s, errors='coerce') < 3.0).mean()*100 if s.notna().any() else np.nan),
-        "Bolus Total (U)": grp["Bolus"].sum() if "Bolus" in df.columns else np.nan,
-        "Carbs Total (g)": grp["Carbs"].sum() if "Carbs" in df.columns else np.nan,
+        "Mean SG (mmol/L)": g["SG"].mean(),
+        "SD SG (mmol/L)": g["SG"].std(),
+        "Time in Range % (3.9–10)": g["SG"].apply(lambda s: pct_in_range(s,3.9,10)),
+        "Time Above Range % (10–13.9)": g["SG"].apply(lambda s: pct_in_range(s,10.01,13.9)),
+        "Time Above Range % (>13.9)": g["SG"].apply(lambda s: (pd.to_numeric(s, errors='coerce')>13.9).mean()*100 if s.notna().any() else np.nan),
+        "Time Below Range % (3.0–3.9)": g["SG"].apply(lambda s: pct_in_range(s,3.0,3.89)),
+        "Time Below Range % (<3.0)": g["SG"].apply(lambda s: (pd.to_numeric(s, errors='coerce')<3.0).mean()*100 if s.notna().any() else np.nan),
+        "Bolus Total (U)": g["Bolus"].sum() if "Bolus" in df.columns else np.nan,
+        "Carbs Total (g)": g["Carbs"].sum() if "Carbs" in df.columns else np.nan,
     }).reset_index()
-
-    out["GMI %"] = 3.31 + 0.43056 * out["Mean SG (mmol/L)"]
+    out["GMI %"] = 3.31 + 0.43056*out["Mean SG (mmol/L)"]
     return out.sort_values("month")
 
 monthly = monthly_summary(data)
 
+# ----------------------------
+# Colour rules
+# ----------------------------
+BEST_PRACTICE = {
+    "Time in Range % (3.9–10)": ("gte", 70),
+    "Time Above Range % (10–13.9)": ("lte", 25),
+    "Time Above Range % (>13.9)": ("lte", 5),
+    "Time Below Range % (3.0–3.9)": ("lte", 4),
+    "Time Below Range % (<3.0)": ("lte", 1),
+    # Optional soft band for mean SG: show green if ~6–8 mmol/L
+    "Mean SG (mmol/L)": ("between", (6.0, 8.0)),
+}
+
+def personal_thresholds(df: pd.DataFrame, band_pp: int = 5):
+    """Build relative thresholds around your own average (±band)."""
+    thr = {}
+    if "Time in Range % (3.9–10)" in df.columns:
+        base = df["Time in Range % (3.9–10)"].mean()
+        thr["Time in Range % (3.9–10)"] = ("gte", base + band_pp)
+    for col in ["Time Above Range % (10–13.9)","Time Above Range % (>13.9)",
+                "Time Below Range % (3.0–3.9)","Time Below Range % (<3.0)"]:
+        if col in df.columns:
+            base = df[col].mean()
+            thr[col] = ("lte", max(base - band_pp, 0))
+    # Mean SG: prefer lower than baseline by 0.2 mmol/L
+    if "Mean SG (mmol/L)" in df.columns:
+        base = df["Mean SG (mmol/L)"].mean()
+        thr["Mean SG (mmol/L)"] = ("lte", base - 0.2)
+    return thr
+
+GREEN = "background-color:#c6efce;color:#006100"
+RED   = "background-color:#ffc7ce;color:#9c0006"
+AMBER = "background-color:#fff2cc;color:#7f6000"
+CLEAR = ""
+
+def style_by_rules(df: pd.DataFrame, mode: str):
+    if mode.startswith("Best"):
+        rules = BEST_PRACTICE
+    else:
+        rules = personal_thresholds(df, personal_band)
+
+    def cell_style(val, col):
+        if pd.isna(val): return CLEAR
+        rule = rules.get(col)
+        if not rule: return CLEAR
+        kind, target = rule
+        if kind == "gte":
+            # green if >= target, amber if close (target-5), red if below
+            if val >= target: return GREEN
+            if val >= max(target-5, 0): return AMBER
+            return RED
+        if kind == "lte":
+            # green if <= target, amber if within +5, red if worse
+            if val <= target: return GREEN
+            if val <= target + 5: return AMBER
+            return RED
+        if kind == "between":
+            lo, hi = target
+            if lo <= val <= hi: return GREEN
+            # amber if within 0.5 mmol/L band
+            if (lo-0.5) <= val <= (hi+0.5): return AMBER
+            return RED
+        return CLEAR
+
+    return df.style.apply(lambda s: [cell_style(v, s.name) for v in s], axis=0)
+
+# ----------------------------
+# Monthly charts (Altair)
+# ----------------------------
 st.subheader("Monthly Trends")
 if have_sg and len(monthly):
     mplot = monthly.copy()
     mplot["month_str"] = mplot["month"].dt.strftime("%b-%Y")
-    # restrict to 2025+ and drop NaN TIR values
     mplot = mplot[(mplot["month"].dt.year >= 2025)]
     mplot = mplot.dropna(subset=["Time in Range % (3.9–10)"])
-
     if not len(mplot):
         st.info("No valid monthly data to plot.")
     else:
-        month_order = mplot["month_str"].tolist()
-
+        order = mplot["month_str"].tolist()
         tir_chart = (
-            alt.Chart(mplot)
-            .mark_line(point=True)
+            alt.Chart(mplot).mark_line(point=True)
             .encode(
-                x=alt.X("month_str:N", title="Month", sort=month_order),
-                y=alt.Y("Time in Range % (3.9–10):Q",
-                        title="Time in Range %",
-                        scale=alt.Scale(domain=[0, 100])),
-                tooltip=[
-                    alt.Tooltip("month_str:N", title="Month"),
-                    alt.Tooltip("Time in Range % (3.9–10):Q", format=".2f"),
-                ],
-            )
-            .properties(height=260, title="Time in Range by Month")
+                x=alt.X("month_str:N", title="Month", sort=order),
+                y=alt.Y("Time in Range % (3.9–10):Q", title="Time in Range %",
+                        scale=alt.Scale(domain=[0,100])),
+                tooltip=[alt.Tooltip("month_str:N", title="Month"),
+                         alt.Tooltip("Time in Range % (3.9–10):Q", format=".2f")]
+            ).properties(height=260, title="Time in Range by Month")
         )
-
         mean_chart = (
-            alt.Chart(mplot)
-            .mark_line(point=True)
+            alt.Chart(mplot).mark_line(point=True)
             .encode(
-                x=alt.X("month_str:N", title="Month", sort=month_order),
-                y=alt.Y("Mean SG (mmol/L):Q",
-                        title="Mean SG (mmol/L)",
-                        scale=alt.Scale(domain=[3, 15])),
-                tooltip=[
-                    alt.Tooltip("month_str:N", title="Month"),
-                    alt.Tooltip("Mean SG (mmol/L):Q", format=".2f"),
-                    alt.Tooltip("GMI %:Q", title="GMI %", format=".2f"),
-                ],
-            )
-            .properties(height=260, title="Mean Glucose by Month")
+                x=alt.X("month_str:N", title="Month", sort=order),
+                y=alt.Y("Mean SG (mmol/L):Q", title="Mean SG (mmol/L)",
+                        scale=alt.Scale(domain=[3,15])),
+                tooltip=[alt.Tooltip("month_str:N", title="Month"),
+                         alt.Tooltip("Mean SG (mmol/L):Q", format=".2f"),
+                         alt.Tooltip("GMI %:Q", title="GMI %", format=".2f")]
+            ).properties(height=260, title="Mean Glucose by Month")
         )
-
         st.altair_chart(tir_chart, use_container_width=True)
         st.altair_chart(mean_chart, use_container_width=True)
 
+# ----------------------------
+# Monthly table (rounded + coloured)
+# ----------------------------
 monthly_display = monthly.copy()
 monthly_display["month"] = monthly_display["month"].dt.strftime("%b-%Y")
 monthly_display = monthly_display.round(2)
-st.dataframe(monthly_display, use_container_width=True)
+st.dataframe(style_by_rules(monthly_display, benchmark_mode), use_container_width=True)
 
 csv_bytes = monthly_display.to_csv(index=False).encode("utf-8")
 st.download_button("Download monthly metrics (CSV)", data=csv_bytes,
@@ -290,11 +325,11 @@ st.download_button("Download monthly metrics (CSV)", data=csv_bytes,
 st.divider()
 
 # ----------------------------
-# Hour-of-day pattern
+# Hour-of-day pattern (with colours)
 # ----------------------------
 st.subheader("Hour-of-day pattern (combined)")
 if have_sg:
-    tmp = data[["dt", "SG"]].dropna().copy()
+    tmp = data[["dt","SG"]].dropna().copy()
     tmp["hour"] = tmp["dt"].dt.hour
     hourly = tmp.groupby("hour").agg(
         **{
@@ -302,12 +337,39 @@ if have_sg:
             "Hyper % (>10)": ("SG", lambda s: (s>10.0).mean()*100),
             "Severe Hyper % (>13.9)": ("SG", lambda s: (s>13.9).mean()*100),
             "Hypo % (<3.9)": ("SG", lambda s: (s<3.9).mean()*100),
-            "Samples": ("SG", "count"),
+            "Samples": ("SG","count"),
         }
     ).reset_index()
     hourly = hourly.round(2)
-    st.dataframe(hourly, use_container_width=True)
+
+    # Simple colouring for hourly (best-practice-like)
+    def style_hourly(df):
+        def color(val, col):
+            if pd.isna(val): return ""
+            if "Time in Range" in col:
+                if val >= 70: return GREEN
+                if val >= 50: return AMBER
+                return RED
+            if "Hypo" in col:
+                if val <= 4: return GREEN
+                if val <= 6: return AMBER
+                return RED
+            if "Hyper" in col:
+                if ">13.9" in col:
+                    thr = 5
+                else:
+                    thr = 25
+                if val <= thr: return GREEN
+                if val <= thr + 5: return AMBER
+                return RED
+            return ""
+        return df.style.apply(lambda s: [color(v, s.name) for v in s], axis=0)
+
+    st.dataframe(style_hourly(hourly), use_container_width=True)
 else:
     st.info("Upload files with CGM values to see hourly patterns.")
 
-st.caption("Rows with future dates are excluded. Charts only plot months from 2025 onwards with valid data.")
+st.caption(
+    "Benchmark colours: Green meets target • Amber near target • Red outside target. "
+    "Best practice uses published TIR/TAR/TBR goals; Personal baseline compares to your average."
+)
