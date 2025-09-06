@@ -1,5 +1,5 @@
 # app.py — Diabetes Trends (CareLink CSV/TSV uploads)
-# Adds: index hidden on tables, auto height (no inner scroll), month/hour shown, colour rules & benchmarks.
+# Fixes: 2-decimal display everywhere, filter to >= 2024-01-01, keep previous UI features.
 
 import io
 import os
@@ -13,13 +13,13 @@ st.set_page_config(page_title="Diabetes Trends", layout="wide")
 st.title("📊 Diabetes Trends (CareLink CSV/TSV uploads)")
 
 STORE_PATH = "data_store.csv.gz"
+DATA_START = pd.Timestamp("2024-01-01")  # ignore anything before this
 
 # ----------------------------
 # Small UI helpers
 # ----------------------------
 def df_auto_height(df: pd.DataFrame, row_px: int = 33, header_px: int = 42, max_px: int = 1800) -> int:
     """Compute a height large enough to show all rows without inner scroll."""
-    # +1 for header; clamp to avoid absurdly tall tables
     return min(max_px, header_px + row_px * (len(df) + 1))
 
 # ----------------------------
@@ -143,9 +143,13 @@ else:
         st.info("Upload CSV/TSV files to begin.")
         st.stop()
 
-# Deduplicate + drop future-dated rows
+# ----------------------------
+# Deduplicate + date filters (>= 2024-01-01 and <= today)
+# ----------------------------
 if "dt" in data.columns:
-    data = data[data["dt"] <= pd.Timestamp.today().normalize()]
+    today = pd.Timestamp.today().normalize()
+    data = data[(data["dt"] <= today) & (data["dt"] >= DATA_START)]
+
 sig_cols = [c for c in ["dt","SG","BG","Bolus","Carbs","source_file"] if c in data.columns]
 if sig_cols:
     data["_sig"] = data[sig_cols].astype(str).agg("|".join, axis=1).str.replace(r"\s+"," ", regex=True)
@@ -268,8 +272,8 @@ def style_by_rules(df: pd.DataFrame, mode: str):
             return RED
         return CLEAR
 
-    # Hide the index (left numbering); keep Month column visible
-    return df.style.apply(lambda s: [cell_style(v, s.name) for v in s], axis=0).hide(axis="index")
+    # colour + force 2dp; hide index later at render
+    return df.style.apply(lambda s: [cell_style(v, s.name) for v in s], axis=0).format(precision=2)
 
 # ----------------------------
 # Monthly charts (Altair)
@@ -278,6 +282,7 @@ st.subheader("Monthly Trends")
 if have_sg and len(monthly):
     mplot = monthly.copy()
     mplot["month_str"] = mplot["month"].dt.strftime("%b-%Y")
+    # Restrict plotted months to 2025+ and drop months with NaN TIR
     mplot = mplot[(mplot["month"].dt.year >= 2025)]
     mplot = mplot.dropna(subset=["Time in Range % (3.9–10)"])
     if not len(mplot):
@@ -309,30 +314,30 @@ if have_sg and len(monthly):
         st.altair_chart(mean_chart, use_container_width=True)
 
 # ----------------------------
-# Monthly table (rounded, coloured, no index, full height)
+# Monthly table (2dp, coloured, no index, full height)
 # ----------------------------
 monthly_display = monthly.copy()
 monthly_display["month"] = monthly_display["month"].dt.strftime("%b-%Y")
 monthly_display = monthly_display.round(2)
-
 # Ensure Month is first column
 cols = ["month"] + [c for c in monthly_display.columns if c != "month"]
 monthly_display = monthly_display[cols]
 
 st.dataframe(
-    style_by_rules(monthly_display, benchmark_mode),
+    style_by_rules(monthly_display, benchmark_mode).hide(axis="index"),
     use_container_width=True,
     height=df_auto_height(monthly_display)
 )
 
-csv_bytes = monthly_display.to_csv(index=False).encode("utf-8")
+# Clean 2dp CSV export
+csv_bytes = monthly_display.round(2).to_csv(index=False).encode("utf-8")
 st.download_button("Download monthly metrics (CSV)", data=csv_bytes,
                    file_name="diabetes_monthly_metrics.csv", mime="text/csv")
 
 st.divider()
 
 # ----------------------------
-# Hour-of-day pattern (with colours; no index; full height)
+# Hour-of-day pattern (2dp, colours; no index; full height)
 # ----------------------------
 st.subheader("Hour-of-day pattern (combined)")
 if have_sg:
@@ -347,7 +352,6 @@ if have_sg:
             "Samples": ("SG","count"),
         }
     ).reset_index()
-
     hourly = hourly.round(2)
 
     GREEN = "background-color:#c6efce;color:#006100"
@@ -371,14 +375,15 @@ if have_sg:
                 if val <= thr + 5: return AMBER
                 return RED
             return ""
-        return df.style.apply(lambda s: [color(v, s.name) for v in s], axis=0).hide(axis="index")
+        # colour + 2dp; hide index later
+        return df.style.apply(lambda s: [color(v, s.name) for v in s], axis=0).format(precision=2)
 
     # Ensure Hour is first column
     cols = ["hour"] + [c for c in hourly.columns if c != "hour"]
     hourly = hourly[cols]
 
     st.dataframe(
-        style_hourly(hourly),
+        style_hourly(hourly).hide(axis="index"),
         use_container_width=True,
         height=df_auto_height(hourly)
     )
@@ -386,6 +391,6 @@ else:
     st.info("Upload files with CGM values to see hourly patterns.")
 
 st.caption(
-    "Benchmark colours: Green meets target • Amber near target • Red outside target. "
-    "Best practice uses published TIR/TAR/TBR goals; Personal baseline compares to your average."
+    "Tables show 2 decimal places. Data limited to dates from 01-Jan-2024 through today. "
+    "Benchmark colours: Green meets target • Amber near target • Red outside target."
 )
