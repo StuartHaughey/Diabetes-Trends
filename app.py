@@ -232,8 +232,8 @@ if have_sg:
     **{
         "Time in Range %": ("SG", lambda s: ((s>=3.9)&(s<=10.0)).mean()*100),
         "Hyper % (>10)": ("SG", lambda s: (s>10.0).mean()*100),
-        "Severe Hyper % (>13.9)": ("SG", lambda s: (s>13.9).mean()*100),
-        "Hypo % (<3.9)": ("SG", lambda s: (s<3.9).mean()*100),
+        "Severe Hyper % (>13.9)": ("SG", lambda s: ((s>13.9).mean())*100),
+        "Hypo % (<3.9)": ("SG", lambda s: ((s<3.9).mean())*100),
         "Samples": ("SG","count")
     }
 ).reset_index()
