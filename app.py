@@ -1,4 +1,4 @@
-# app.py — Diabetes Trends (CareLink CSV/TSV uploads) with future-date filtering
+# app.py — Diabetes Trends (CareLink CSV/TSV uploads) with fixes for phantom months and NaN charts
 
 import io
 import os
@@ -230,51 +230,53 @@ def monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
 monthly = monthly_summary(data)
 
 st.subheader("Monthly Trends")
-if have_sg:
-    st.subheader("Monthly Trends")
 if have_sg and len(monthly):
     mplot = monthly.copy()
     mplot["month_str"] = mplot["month"].dt.strftime("%b-%Y")
-    # keep original order
-    month_order = mplot["month_str"].tolist()
+    # restrict to 2025+ and drop NaN TIR values
+    mplot = mplot[(mplot["month"].dt.year >= 2025)]
+    mplot = mplot.dropna(subset=["Time in Range % (3.9–10)"])
 
-    tir_chart = (
-        alt.Chart(mplot)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("month_str:N", title="Month", sort=month_order),
-            y=alt.Y("Time in Range % (3.9–10):Q",
-                    title="Time in Range %", scale=alt.Scale(domain=[0, 100])),
-            tooltip=[
-                alt.Tooltip("month_str:N", title="Month"),
-                alt.Tooltip("Time in Range % (3.9–10):Q", format=".2f"),
-            ],
+    if not len(mplot):
+        st.info("No valid monthly data to plot.")
+    else:
+        month_order = mplot["month_str"].tolist()
+
+        tir_chart = (
+            alt.Chart(mplot)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("month_str:N", title="Month", sort=month_order),
+                y=alt.Y("Time in Range % (3.9–10):Q",
+                        title="Time in Range %",
+                        scale=alt.Scale(domain=[0, 100])),
+                tooltip=[
+                    alt.Tooltip("month_str:N", title="Month"),
+                    alt.Tooltip("Time in Range % (3.9–10):Q", format=".2f"),
+                ],
+            )
+            .properties(height=260, title="Time in Range by Month")
         )
-        .properties(height=260, title="Time in Range by Month")
-    )
 
-    mean_chart = (
-        alt.Chart(mplot)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("month_str:N", title="Month", sort=month_order),
-            y=alt.Y("Mean SG (mmol/L):Q",
-                    title="Mean Sensor Glucose (mmol/L)",
-                    scale=alt.Scale(domain=[3, 15])),
-            tooltip=[
-                alt.Tooltip("month_str:N", title="Month"),
-                alt.Tooltip("Mean SG (mmol/L):Q", format=".2f"),
-                alt.Tooltip("GMI %:Q", title="GMI %", format=".2f"),
-            ],
+        mean_chart = (
+            alt.Chart(mplot)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("month_str:N", title="Month", sort=month_order),
+                y=alt.Y("Mean SG (mmol/L):Q",
+                        title="Mean SG (mmol/L)",
+                        scale=alt.Scale(domain=[3, 15])),
+                tooltip=[
+                    alt.Tooltip("month_str:N", title="Month"),
+                    alt.Tooltip("Mean SG (mmol/L):Q", format=".2f"),
+                    alt.Tooltip("GMI %:Q", title="GMI %", format=".2f"),
+                ],
+            )
+            .properties(height=260, title="Mean Glucose by Month")
         )
-        .properties(height=260, title="Mean Glucose by Month")
-    )
 
-    st.altair_chart(tir_chart, use_container_width=True)
-    st.altair_chart(mean_chart, use_container_width=True)
-else:
-    st.info("Not enough monthly data to plot yet.")
-
+        st.altair_chart(tir_chart, use_container_width=True)
+        st.altair_chart(mean_chart, use_container_width=True)
 
 monthly_display = monthly.copy()
 monthly_display["month"] = monthly_display["month"].dt.strftime("%b-%Y")
@@ -308,4 +310,4 @@ if have_sg:
 else:
     st.info("Upload files with CGM values to see hourly patterns.")
 
-st.caption("Rows with future dates are automatically excluded.")
+st.caption("Rows with future dates are excluded. Charts only plot months from 2025 onwards with valid data.")
