@@ -1,6 +1,6 @@
 # app.py — Diabetes Trends (CareLink CSV/TSV uploads)
-# Fix: standardise monthly column names (TIR %, TAR %, TBR %) and plot TIR reliably.
-# Keeps: 2dp, colouring, hidden index, Month/Hour first, no inner scroll, persistence.
+# New: Analysis window toggle (All data vs Last 12 months, rolling)
+# Keeps: 2dp, colour rules, hidden index, Month/Hour first, no inner scroll, persistence.
 
 import io, os, re
 import numpy as np
@@ -12,7 +12,7 @@ st.set_page_config(page_title="Diabetes Trends", layout="wide")
 st.title("📊 Diabetes Trends (CareLink CSV/TSV uploads)")
 
 STORE_PATH = "data_store.csv.gz"
-DATA_START = pd.Timestamp("2024-01-01")  # fence the analysis window
+DATA_START = pd.Timestamp("2024-01-01")  # ignore anything before this when loading
 
 # ---------- helpers ----------
 def df_auto_height(df: pd.DataFrame, row_px: int = 33, header_px: int = 42, max_px: int = 1800) -> int:
@@ -101,6 +101,13 @@ benchmark_mode = st.sidebar.radio("Colour-coding against:", ["Best practice (gui
 personal_band = st.sidebar.slider("Personal band (± percentage points)", 2, 10, 5)
 show_samples = st.sidebar.toggle("Show hourly 'Samples' column", value=False)
 
+st.sidebar.header("Analysis window")
+analysis_mode = st.sidebar.radio(
+    "Use data from:",
+    ["Last 12 months (rolling)", "All available data"],
+    index=0
+)
+
 # ---------- load data ----------
 if use_stored and stored is not None:
     data = stored.copy()
@@ -120,7 +127,7 @@ else:
     else:
         st.info("Upload CSV/TSV files to begin."); st.stop()
 
-# dedupe + date fence
+# dedupe + base date fence (>= DATA_START .. today)
 if "dt" in data.columns:
     today = pd.Timestamp.today().normalize()
     data = data[(data["dt"] >= DATA_START) & (data["dt"] <= today)]
@@ -136,13 +143,28 @@ if sig_cols:
 if "dt" not in data.columns or data["dt"].isna().all():
     st.error("Couldn’t detect Date/Time in the dataset."); st.stop()
 
+# ---------- apply analysis window ----------
+latest_dt = pd.to_datetime(data["dt"]).max()
+if analysis_mode.startswith("Last 12"):
+    cutoff = (latest_dt - pd.Timedelta(days=365)).normalize()
+    analysis = data[data["dt"] >= cutoff].copy()
+else:
+    cutoff = data["dt"].min().normalize()
+    analysis = data.copy()
+
+# Sidebar hint of effective range
+earliest_dt = pd.to_datetime(analysis["dt"]).min().date()
+latest_dt_display = latest_dt.date()
+st.sidebar.caption(f"Analysing: **{earliest_dt} → {latest_dt_display}**")
+
+# Persisted dataset option
 if not use_stored and st.button("💾 Save as current dataset"):
     save_store(data); st.success("Saved. Mobile will load this dataset automatically.")
 
 st.divider()
 
 # ---------- metrics ----------
-sg = pd.to_numeric(data.get("SG"), errors="coerce")
+sg = pd.to_numeric(analysis.get("SG"), errors="coerce")
 have_sg = sg.notna().sum() > 0
 c1,c2,c3,c4 = st.columns(4)
 if have_sg:
@@ -154,10 +176,10 @@ if have_sg:
     with c3: st.metric("Time in Range 3.9–10", f"{tir:.2f}%")
 else:
     with c1: st.info("No CGM values detected.")
-if "Bolus" in data.columns:
-    total_bolus = pd.to_numeric(data["Bolus"], errors="coerce").fillna(0)
-    src = data.get("Bolus Source", pd.Series("", index=data.index)).astype(str).str.upper()
-    auto_units = total_bolus.where(src.str.contains("AUTO_INSULIN"), 0).sum()
+if "Bolus" in analysis.columns:
+    total_bolus = pd.to_numeric(analysis["Bolus"], errors="coerce").fillna(0)
+    src = analysis.get("Bolus Source", pd.Series("", index=analysis.index)).astype(str).str.upper()
+    auto_units = total_bolus.where(src.str_contains("AUTO_INSULIN", na=False), 0).sum()
     ac_pct = (auto_units/total_bolus.sum()*100) if total_bolus.sum() else np.nan
     with c4: st.metric("Auto-corrections (% bolus)", f"{ac_pct:.2f}%" if pd.notna(ac_pct) else "—")
 else:
@@ -166,8 +188,8 @@ else:
 st.divider()
 
 # ---------- monthly summary ----------
-data["date"]  = data["dt"].dt.date
-data["month"] = data["dt"].dt.to_period("M")
+analysis["date"]  = analysis["dt"].dt.date
+analysis["month"] = analysis["dt"].dt.to_period("M")
 
 def pct_in_range(x, lo, hi):
     x = pd.to_numeric(x, errors="coerce").dropna()
@@ -189,7 +211,7 @@ def monthly_summary(df):
     out["GMI %"] = 3.31 + 0.43056*out["Mean SG (mmol/L)"]
     return out.sort_values("month")
 
-monthly = monthly_summary(data)
+monthly = monthly_summary(analysis)
 
 # ---------- colour rules ----------
 BEST_PRACTICE = {
@@ -244,20 +266,19 @@ st.subheader("Monthly Trends")
 if have_sg and len(monthly):
     mplot = monthly.copy()
     mplot["month_str"] = mplot["month"].dt.strftime("%b-%Y")
-    # use same fence as data; drop rows with missing TIR
-    mplot = mplot[mplot["month"].dt.to_timestamp() >= DATA_START]
     mplot = mplot.dropna(subset=["TIR %"])
     if not len(mplot):
         st.info("No valid monthly data to plot.")
     else:
         order = mplot["month_str"].tolist()
+        subtitle = "Last 12 months" if analysis_mode.startswith("Last 12") else "All data"
         tir_chart = (
             alt.Chart(mplot).mark_line(point=True)
             .encode(
                 x=alt.X("month_str:N", title="Month", sort=order),
                 y=alt.Y("TIR %:Q", title="Time in Range %", scale=alt.Scale(domain=[0,100])),
                 tooltip=[alt.Tooltip("month_str:N", title="Month"), alt.Tooltip("TIR %:Q", format=".2f")]
-            ).properties(height=260, title="Time in Range by Month")
+            ).properties(height=260, title=f"Time in Range by Month • {subtitle}")
         )
         mean_chart = (
             alt.Chart(mplot).mark_line(point=True)
@@ -267,7 +288,7 @@ if have_sg and len(monthly):
                 tooltip=[alt.Tooltip("month_str:N", title="Month"),
                          alt.Tooltip("Mean SG (mmol/L):Q", format=".2f"),
                          alt.Tooltip("GMI %:Q", title="GMI %", format=".2f")]
-            ).properties(height=260, title="Mean Glucose by Month")
+            ).properties(height=260, title=f"Mean Glucose by Month • {subtitle}")
         )
         st.altair_chart(tir_chart, use_container_width=True)
         st.altair_chart(mean_chart, use_container_width=True)
@@ -277,7 +298,6 @@ monthly_display = monthly.copy()
 monthly_display["month"] = monthly_display["month"].dt.strftime("%b-%Y")
 monthly_display = monthly_display.round(2)
 
-# Month first; totals last
 tail_cols = [c for c in ["Bolus Total (U)","Carbs Total (g)"] if c in monthly_display.columns]
 ordered = ["month","TIR %","TAR % (10–13.9)","TAR % (>13.9)","TBR % (3.0–3.9)","TBR % (<3.0)",
            "Mean SG (mmol/L)","SD SG (mmol/L)"] + tail_cols
@@ -300,7 +320,7 @@ st.divider()
 # ---------- hourly pattern ----------
 st.subheader("Hour-of-day pattern (combined)")
 if have_sg:
-    tmp = data[["dt","SG"]].dropna().copy()
+    tmp = analysis[["dt","SG"]].dropna().copy()
     tmp["hour"] = tmp["dt"].dt.hour
     hourly = tmp.groupby("hour").agg(
         **{
@@ -349,6 +369,6 @@ else:
     st.info("Upload files with CGM values to see hourly patterns.")
 
 st.caption(
-    "Tables show 2 decimal places. Data limited to dates from 01-Jan-2024 through today. "
+    "Tables show 2 decimal places. Analysis window is set in the sidebar (Last 12 months or All data). "
     "Benchmark colours: Green meets target • Amber near target • Red outside target."
 )
