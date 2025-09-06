@@ -1,4 +1,7 @@
-streamlit
-pandas
-numpy
-altair
+streamlit>=1.36
+pandas>=2.2
+altair>=5.3
+numpy>=1.26
+matplotlib>=3.8
+reportlab>=4.0
+Pillow>=10.3
