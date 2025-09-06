@@ -347,6 +347,100 @@ st.download_button("Download monthly metrics (CSV)", data=csv_bytes,
                    file_name="diabetes_monthly_metrics.csv", mime="text/csv")
 
 st.divider()
+# =========================
+#     COMPARISONS PANEL
+# =========================
+st.divider()
+st.subheader("Comparisons")
+
+def _compare_windows(monthly_df: pd.DataFrame, n: int):
+    """Return (prior_df, curr_df, metrics_df) for n-month comparison; None if not enough data."""
+    if len(monthly_df) < 2*n:
+        return None
+    # Work on a copy sorted by month
+    m = monthly_df.sort_values("month").copy()
+    prior = m.iloc[-2*n:-n]
+    curr  = m.iloc[-n:]
+
+    def mean_or_nan(df, col):
+        return pd.to_numeric(df[col], errors="coerce").mean() if col in df.columns else np.nan
+
+    # Key metrics
+    metrics = [
+        ("Mean SG (mmol/L)", False),
+        ("TIR %", True),
+        ("TBR % (<3.0)", True),
+        ("TAR % (>13.9)", True),
+    ]
+    rows = []
+    for col, is_pct in metrics:
+        p = mean_or_nan(prior, col)
+        c = mean_or_nan(curr, col)
+        delta = c - p
+        rows.append((col, p, c, delta, is_pct))
+    result = pd.DataFrame(rows, columns=["Metric","Prior","Current","Δ (Curr-Prior)","is_pct"])
+    return prior, curr, result
+
+def _fmt_metric(value, is_pct=False):
+    if pd.isna(value): return "—"
+    return f"{value:.2f}%" if is_pct else f"{value:.2f}"
+
+def _show_comp(n: int):
+    out = _compare_windows(monthly, n)
+    if out is None:
+        st.info(f"Not enough months to compare {n} vs prior {n}. Need at least {2*n} months in the selected window.")
+        return
+    prior, curr, dfm = out
+
+    # Metrics row
+    c1, c2, c3, c4 = st.columns(4)
+    targets = [
+        ("Mean SG (mmol/L)", c1, False),
+        ("TIR %",             c2, True),
+        ("TBR % (<3.0)",      c3, True),
+        ("TAR % (>13.9)",     c4, True),
+    ]
+    for name, col, is_pct in targets:
+        row = dfm[dfm["Metric"] == name].iloc[0]
+        with col:
+            st.metric(
+                label=name,
+                value=_fmt_metric(row["Current"], is_pct),
+                delta=_fmt_metric(row["Δ (Curr-Prior)"], is_pct),
+                delta_color="normal"  # green for up/down is subjective; keep neutral
+            )
+
+    # Bar: TIR % prior vs current
+    if "TIR %" in curr.columns:
+        dplot = pd.DataFrame({
+            "Window": [f"Prior {n}", f"Last {n}"],
+            "TIR %": [pd.to_numeric(prior["TIR %"], errors="coerce").mean(),
+                      pd.to_numeric(curr["TIR %"], errors="coerce").mean()]
+        })
+        st.altair_chart(
+            alt.Chart(dplot).mark_bar().encode(
+                x=alt.X("Window:N", title=None),
+                y=alt.Y("TIR %:Q", title="TIR %", scale=alt.Scale(domain=[0,100])),
+                tooltip=[alt.Tooltip("TIR %:Q", format=".2f")]
+            ).properties(height=220, title=f"TIR % — Prior {n} vs Last {n}"),
+            use_container_width=True
+        )
+
+    # Tiny table with numbers
+    tidy = dfm[["Metric","Prior","Current","Δ (Curr-Prior)"]].copy()
+    # Format numbers to 2 dp for display
+    for col in ["Prior","Current","Δ (Curr-Prior)"]:
+        # find if metric is pct
+        tidy[col] = [
+            _fmt_metric(v, bool(dfm.loc[i, "is_pct"])) for i, v in enumerate(dfm[col].values)
+        ]
+    st.dataframe(tidy, use_container_width=True, hide_index=True, height= df_auto_height(tidy))
+
+# Tabs for 3/6/12 month comparisons
+t3, t6, t12 = st.tabs([ "Last 3 vs prior 3", "Last 6 vs prior 6", "Last 12 vs prior 12" ])
+with t3:  _show_comp(3)
+with t6:  _show_comp(6)
+with t12: _show_comp(12)
 
 # ---------- hourly pattern ----------
 st.subheader("Hour-of-day pattern (combined)")
