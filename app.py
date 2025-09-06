@@ -1,5 +1,5 @@
 # app.py — Diabetes Trends (CareLink CSV/TSV uploads)
-# Paste this whole file into your repo and redeploy.
+# Drop this whole file into your repo and redeploy.
 
 import io
 import re
@@ -83,10 +83,7 @@ def parse_file(file) -> pd.DataFrame:
         df["month"] = df["dt"].dt.to_period("M")
 
     # Keep a friendly filename for later debugging
-    if not hasattr(file, "name"):
-        df["source_file"] = "uploaded_file"
-    else:
-        df["source_file"] = file.name
+    df["source_file"] = getattr(file, "name", "uploaded_file")
 
     return df
 
@@ -108,7 +105,7 @@ frames, bad = [], []
 for f in uploaded_files:
     try:
         frames.append(parse_file(f))
-    except Exception as e:
+    except Exception:
         bad.append(f.name)
 
 if bad:
@@ -141,24 +138,21 @@ if have_sg:
     # GMI (%) for mmol/L:  GMI = 3.31 + 0.43056 * mean_glucose
     gmi = 3.31 + 0.43056 * mean_sg
     tir = ((sg >= 3.9) & (sg <= 10.0)).mean() * 100
-    with col1: st.metric("Mean SG (mmol/L)", f"{mean_sg:.1f}")
+    with col1: st.metric("Mean SG (mmol/L)", f"{mean_sg:.2f}")
     with col2: st.metric("GMI (%)", f"{gmi:.2f}")
-    with col3: st.metric("Time in Range 3.9–10", f"{tir:.1f}%")
+    with col3: st.metric("Time in Range 3.9–10", f"{tir:.2f}%")
 else:
     with col1: st.info("No CGM (SG) values detected.")
 
 # Auto-correction % (MiniMed 780G) using Bolus Source and carb entries
 if "Bolus" in data.columns:
     total_bolus = pd.to_numeric(data["Bolus"], errors="coerce").fillna(0)
-    # Treat any row with carbs as a meal bolus proxy
-    carbs = pd.to_numeric(data.get("Carbs", pd.Series(index=data.index, dtype=float))), 
-    carbs = pd.to_numeric(data.get("Carbs"), errors="coerce").fillna(0) if "Carbs" in data.columns else pd.Series(0, index=data.index, dtype=float)
-    meal_mask = carbs > 0
+    carbs_col = pd.to_numeric(data.get("Carbs"), errors="coerce").fillna(0) if "Carbs" in data.columns else pd.Series(0, index=data.index, dtype=float)
     # Identify auto-corrections via Bolus Source flag
     src = data.get("Bolus Source", pd.Series("", index=data.index)).astype(str).str.upper()
     auto_units = total_bolus.where(src.str.contains("AUTO_INSULIN"), 0).sum()
     autocorr_pct = (auto_units / total_bolus.sum() * 100) if total_bolus.sum() else np.nan
-    with col4: st.metric("Auto-corrections (% bolus)", f"{autocorr_pct:.1f}%" if pd.notna(autocorr_pct) else "—")
+    with col4: st.metric("Auto-corrections (% bolus)", f"{autocorr_pct:.2f}%" if pd.notna(autocorr_pct) else "—")
 else:
     with col4: st.info("No bolus data detected.")
 
@@ -194,15 +188,19 @@ def monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 monthly = monthly_summary(data)
+monthly_display = monthly.copy()
+monthly_display["month"] = monthly_display["month"].astype(str)
+monthly_display = monthly_display.round(2)
 
 st.subheader("Monthly Trends")
 if have_sg:
+    # Charts expect numeric index; keep month order by using the original Period index
     st.line_chart(monthly.set_index("month")[["TIR_% (3.9–10)"]])
     st.line_chart(monthly.set_index("month")[["mean_SG_mmol/L"]])
-st.dataframe(monthly, use_container_width=True)
+st.dataframe(monthly_display, use_container_width=True)
 
-# Download button for computed monthly metrics
-csv_bytes = monthly.to_csv(index=False).encode("utf-8")
+# Download button for computed monthly metrics (rounded to 2 decimals)
+csv_bytes = monthly_display.to_csv(index=False).encode("utf-8")
 st.download_button("Download monthly metrics (CSV)", data=csv_bytes, file_name="diabetes_monthly_metrics.csv", mime="text/csv")
 
 st.divider()
@@ -221,6 +219,7 @@ if have_sg:
         Hypo_pct=("SG", lambda s: (s<3.9).mean()*100),
         samples=("SG","count")
     ).reset_index()
+    hourly = hourly.round(2)
     st.dataframe(hourly, use_container_width=True)
 else:
     st.info("Upload files that include CGM (SG) values to see hourly patterns.")
