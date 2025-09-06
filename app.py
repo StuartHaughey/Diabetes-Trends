@@ -377,6 +377,25 @@ if have_sg:
     )
 else:
     st.info("Upload files with CGM values to see hourly patterns.")
+st.divider()
+st.subheader("📖 Best Practice Targets")
+
+with st.expander("View international consensus guidelines"):
+    st.markdown("""
+    These benchmarks are based on the **International Consensus on Time in Range (2019)**, 
+    widely adopted by ADA, EASD and other professional bodies.
+
+    - **Time in Range (3.9–10 mmol/L):** ≥ 70% of readings  
+    - **Time Above Range (10–13.9 mmol/L):** < 25%  
+    - **Time Above Range (>13.9 mmol/L):** < 5%  
+    - **Time Below Range (3.0–3.9 mmol/L):** < 4%  
+    - **Time Below Range (<3.0 mmol/L):** < 1%  
+    - **Mean SG (Sensor Glucose):** roughly corresponds to an HbA1c of < 7% (target varies individually)  
+
+    ⚪️ **Green cells** = meets guideline  
+    🟡 **Amber cells** = close to target  
+    🔴 **Red cells** = outside guideline
+    """)
 
 st.caption(
     "Tables show 2 decimal places. Analysis window is set in the sidebar (Last 12 months or All data). "
