@@ -8,15 +8,22 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
-# For PDF & charts used in PDF
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import cm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+# For PDF & charts used in PDF (graceful fallback if not installed)
+PDF_AVAILABLE = True
+PDF_IMPORT_ERROR = ""
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+except Exception as _e:
+    PDF_AVAILABLE = False
+    PDF_IMPORT_ERROR = str(_e)
+
 
 st.set_page_config(page_title="Diabetes Trends", layout="wide")
 st.title("📊 Diabetes Trends (CareLink CSV/TSV uploads)")
@@ -581,11 +588,15 @@ if have_sg:
 
 # ---------- export button ----------
 st.subheader("Doctor export")
-col_a, _ = st.columns([1,3])
-with col_a:
-    if st.button("🧾 Generate one-page PDF"):
-        # keep a compact monthly selection for plots (all rows in window, already fenced)
-        monthly_for_pdf = monthly_display.copy()
-        # build PDF bytes
-        pdf_bytes = build_pdf(patient_name, window_label, monthly_for_pdf, hourly_export, include_comments=True if include_comments else False)
-        st.download_button("Download PDF", data=pdf_bytes, file_name="diabetes_summary.pdf", mime="application/pdf")
+
+if not PDF_AVAILABLE:
+    st.info(
+        "PDF export is temporarily unavailable on this deployment. "
+        "Install dependencies and redeploy: `matplotlib` and `reportlab`."
+    )
+else:
+    col_a, _ = st.columns([1,3])
+    with col_a:
+        if st.button("🧾 Generate one-page PDF"):
+            pdf_bytes = build_pdf(patient_name, window_label, monthly_display.copy(), hourly_export, include_comments)
+            st.download_button("Download PDF", data=pdf_bytes, file_name="diabetes_summary.pdf", mime="application/pdf")
