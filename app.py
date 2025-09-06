@@ -424,37 +424,27 @@ st.caption(
 # =========================
 
 def _mini_tir_line_png(monthly_df: pd.DataFrame) -> str:
-    """Return path to a PNG line plot of TIR % by month."""
     if not len(monthly_df): return ""
     fig, ax = plt.subplots(figsize=(6, 2.4), dpi=150)
-    x = pd.to_datetime(monthly_df["month"].astype(str).str.replace(r'-\d+$','-01', regex=True))
-    ax.plot(x, monthly_df["TIR %"], marker="o", linewidth=1.5)
-    ax.set_ylim(0, 100)
-    ax.set_ylabel("TIR %")
-    ax.set_xlabel("")
-    ax.grid(True, alpha=0.3)
+    x = _month_series_to_datetime(monthly_df["month"]).dropna()
+    y = monthly_df.loc[x.index, "TIR %"]
+    ax.plot(x, y, marker="o", linewidth=1.5)
+    ax.set_ylim(0, 100); ax.set_ylabel("TIR %"); ax.set_xlabel(""); ax.grid(True, alpha=0.3)
     fig.autofmt_xdate(rotation=0)
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    fig.tight_layout()
-    fig.savefig(tmp.name, bbox_inches="tight")
-    plt.close(fig)
+    fig.tight_layout(); fig.savefig(tmp.name, bbox_inches="tight"); plt.close(fig)
     return tmp.name
 
 def _mini_mean_line_png(monthly_df: pd.DataFrame) -> str:
-    """Return path to a PNG line plot of Mean SG by month."""
     if not len(monthly_df): return ""
     fig, ax = plt.subplots(figsize=(6, 2.4), dpi=150)
-    x = pd.to_datetime(monthly_df["month"].astype(str).str.replace(r'-\d+$','-01', regex=True))
-    ax.plot(x, monthly_df["Mean SG (mmol/L)"], marker="o", linewidth=1.5)
-    ax.set_ylim(3, 15)
-    ax.set_ylabel("Mean SG (mmol/L)")
-    ax.set_xlabel("")
-    ax.grid(True, alpha=0.3)
+    x = _month_series_to_datetime(monthly_df["month"]).dropna()
+    y = monthly_df.loc[x.index, "Mean SG (mmol/L)"]
+    ax.plot(x, y, marker="o", linewidth=1.5)
+    ax.set_ylim(3, 15); ax.set_ylabel("Mean SG (mmol/L)"); ax.set_xlabel(""); ax.grid(True, alpha=0.3)
     fig.autofmt_xdate(rotation=0)
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    fig.tight_layout()
-    fig.savefig(tmp.name, bbox_inches="tight")
-    plt.close(fig)
+    fig.tight_layout(); fig.savefig(tmp.name, bbox_inches="tight"); plt.close(fig)
     return tmp.name
 
 def _hourly_tir_bar_png(hourly_df: pd.DataFrame) -> str:
@@ -598,5 +588,7 @@ else:
     col_a, _ = st.columns([1,3])
     with col_a:
         if st.button("🧾 Generate one-page PDF"):
-            pdf_bytes = build_pdf(patient_name, window_label, monthly_display.copy(), hourly_export, include_comments)
+            # was: monthly_for_pdf = monthly_display.copy()
+monthly_for_pdf = monthly.copy()
+            pdf_bytes = build_pdf(patient_name, window_label, monthly_for_pdf, hourly_export, include_comments)
             st.download_button("Download PDF", data=pdf_bytes, file_name="diabetes_summary.pdf", mime="application/pdf")
