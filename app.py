@@ -1,5 +1,5 @@
 # app.py — Diabetes Trends (CareLink CSV/TSV uploads)
-# Drop this whole file into your repo and redeploy.
+# Drop this whole file into your repo and redeploy on Streamlit Cloud.
 
 import io
 import re
@@ -147,7 +147,6 @@ else:
 # Auto-correction % (MiniMed 780G) using Bolus Source and carb entries
 if "Bolus" in data.columns:
     total_bolus = pd.to_numeric(data["Bolus"], errors="coerce").fillna(0)
-    carbs_col = pd.to_numeric(data.get("Carbs"), errors="coerce").fillna(0) if "Carbs" in data.columns else pd.Series(0, index=data.index, dtype=float)
     # Identify auto-corrections via Bolus Source flag
     src = data.get("Bolus Source", pd.Series("", index=data.index)).astype(str).str.upper()
     auto_units = total_bolus.where(src.str.contains("AUTO_INSULIN"), 0).sum()
@@ -161,7 +160,7 @@ st.divider()
 # ----------------------------
 # Monthly trends + tables
 # ----------------------------
-data["date"] = data["dt"].dt.date
+data["date"]  = data["dt"].dt.date
 data["month"] = data["dt"].dt.to_period("M")
 
 def pct_in_range(x, lo, hi):
@@ -185,34 +184,20 @@ def monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
     # GMI from mean SG
     out["GMI %"] = 3.31 + 0.43056 * out["Mean SG (mmol/L)"]
     out = out.sort_values("month")
-    out = out.rename(columns={
-    "mean_SG_mmol/L": "Mean SG (mmol/L)",
-    "sd_SG_mmol/L": "SD SG (mmol/L)",
-    "TIR_% (3.9–10)": "Time in Range % (3.9–10)",
-    "TAR_% (10–13.9)": "Time Above Range % (10–13.9)",
-    "TAR_% (>13.9)": "Time Above Range % (>13.9)",
-    "TBR_% (3.0–3.9)": "Time Below Range % (3.0–3.9)",
-    "TBR_% (<3.0)": "Time Below Range % (<3.0)",
-    "Bolus_total_U": "Bolus Total (U)",
-    "Carbs_total_g": "Carbs Total (g)",
-    "GMI_%": "GMI %"
-})
-
     return out
 
-
 monthly = monthly_summary(data)
-monthly_display = monthly.copy()
-# Reformat Period to nice string like Jan-2025
-monthly_display["month"] = monthly_display["month"].dt.strftime("%b-%Y")
-monthly_display = monthly_display.round(2)
 
-
+# ---- Charts (use Period index for correct order) ----
 st.subheader("Monthly Trends")
 if have_sg:
-    # Charts expect numeric index; keep month order by using the original Period index
-    st.line_chart(monthly.set_index("month")[["TIR_% (3.9–10)"]])
-    st.line_chart(monthly.set_index("month")[["mean_SG_mmol/L"]])
+    st.line_chart(monthly.set_index("month")[["Time in Range % (3.9–10)"]])
+    st.line_chart(monthly.set_index("month")[["Mean SG (mmol/L)"]])
+
+# ---- Display table with pretty month labels & 2-dec rounding ----
+monthly_display = monthly.copy()
+monthly_display["month"] = monthly_display["month"].dt.strftime("%b-%Y")
+monthly_display = monthly_display.round(2)
 st.dataframe(monthly_display, use_container_width=True)
 
 # Download button for computed monthly metrics (rounded to 2 decimals)
@@ -229,23 +214,15 @@ if have_sg:
     tmp = data[["dt", "SG"]].dropna().copy()
     tmp["hour"] = tmp["dt"].dt.hour
     hourly = tmp.groupby("hour").agg(
-    **{
-        "Time in Range %": ("SG", lambda s: ((s>=3.9)&(s<=10.0)).mean()*100),
-        "Hyper % (>10)": ("SG", lambda s: (s>10.0).mean()*100),
-        "Severe Hyper % (>13.9)": ("SG", lambda s: ((s>13.9).mean())*100),
-        "Hypo % (<3.9)": ("SG", lambda s: ((s<3.9).mean())*100),
-        "Samples": ("SG","count")
-    }
-).reset_index()
-hourly = hourly.rename(columns={
-    "TIR_pct": "Time in Range %",
-    "Hyper_pct": "Hyper % (>10)",
-    "SevereHyper_pct": "Severe Hyper % (>13.9)",
-    "Hypo_pct": "Hypo % (<3.9)",
-    "samples": "Samples"
-})
-
-hourly = hourly.round(2)
-   st.dataframe(hourly, use_container_width=True)
+        **{
+            "Time in Range %": ("SG", lambda s: ((s>=3.9)&(s<=10.0)).mean()*100),
+            "Hyper % (>10)": ("SG", lambda s: (s>10.0).mean()*100),
+            "Severe Hyper % (>13.9)": ("SG", lambda s: (s>13.9).mean()*100),
+            "Hypo % (<3.9)": ("SG", lambda s: (s<3.9).mean()*100),
+            "Samples": ("SG", "count"),
+        }
+    ).reset_index()
+    hourly = hourly.round(2)
+    st.dataframe(hourly, use_container_width=True)
 else:
     st.info("Upload files that include CGM (SG) values to see hourly patterns.")
