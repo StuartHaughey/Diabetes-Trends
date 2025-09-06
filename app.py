@@ -6,6 +6,7 @@ import re
 import numpy as np
 import pandas as pd
 import streamlit as st
+import altair as alt
 from datetime import datetime
 
 st.set_page_config(page_title="Diabetes Trends", layout="wide")
@@ -230,8 +231,50 @@ monthly = monthly_summary(data)
 
 st.subheader("Monthly Trends")
 if have_sg:
-    st.line_chart(monthly.set_index("month")[["Time in Range % (3.9–10)"]])
-    st.line_chart(monthly.set_index("month")[["Mean SG (mmol/L)"]])
+    st.subheader("Monthly Trends")
+if have_sg and len(monthly):
+    mplot = monthly.copy()
+    mplot["month_str"] = mplot["month"].dt.strftime("%b-%Y")
+    # keep original order
+    month_order = mplot["month_str"].tolist()
+
+    tir_chart = (
+        alt.Chart(mplot)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("month_str:N", title="Month", sort=month_order),
+            y=alt.Y("Time in Range % (3.9–10):Q",
+                    title="Time in Range %", scale=alt.Scale(domain=[0, 100])),
+            tooltip=[
+                alt.Tooltip("month_str:N", title="Month"),
+                alt.Tooltip("Time in Range % (3.9–10):Q", format=".2f"),
+            ],
+        )
+        .properties(height=260, title="Time in Range by Month")
+    )
+
+    mean_chart = (
+        alt.Chart(mplot)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("month_str:N", title="Month", sort=month_order),
+            y=alt.Y("Mean SG (mmol/L):Q",
+                    title="Mean Sensor Glucose (mmol/L)",
+                    scale=alt.Scale(domain=[3, 15])),
+            tooltip=[
+                alt.Tooltip("month_str:N", title="Month"),
+                alt.Tooltip("Mean SG (mmol/L):Q", format=".2f"),
+                alt.Tooltip("GMI %:Q", title="GMI %", format=".2f"),
+            ],
+        )
+        .properties(height=260, title="Mean Glucose by Month")
+    )
+
+    st.altair_chart(tir_chart, use_container_width=True)
+    st.altair_chart(mean_chart, use_container_width=True)
+else:
+    st.info("Not enough monthly data to plot yet.")
+
 
 monthly_display = monthly.copy()
 monthly_display["month"] = monthly_display["month"].dt.strftime("%b-%Y")
