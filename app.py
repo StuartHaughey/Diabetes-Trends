@@ -189,8 +189,10 @@ def monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 monthly = monthly_summary(data)
 monthly_display = monthly.copy()
-monthly_display["month"] = monthly_display["month"].astype(str)
+# Reformat Period to nice string like Jan-2025
+monthly_display["month"] = monthly_display["month"].dt.strftime("%b-%Y")
 monthly_display = monthly_display.round(2)
+
 
 st.subheader("Monthly Trends")
 if have_sg:
