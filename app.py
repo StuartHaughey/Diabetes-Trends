@@ -245,7 +245,7 @@ hourly = hourly.rename(columns={
     "samples": "Samples"
 })
 
-    hourly = hourly.round(2)
-    st.dataframe(hourly, use_container_width=True)
+hourly = hourly.round(2)
+   st.dataframe(hourly, use_container_width=True)
 else:
     st.info("Upload files that include CGM (SG) values to see hourly patterns.")
