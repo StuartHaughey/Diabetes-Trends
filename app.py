@@ -178,12 +178,22 @@ else:
     with c1: st.info("No CGM values detected.")
 if "Bolus" in analysis.columns:
     total_bolus = pd.to_numeric(analysis["Bolus"], errors="coerce").fillna(0)
-    src = analysis.get("Bolus Source", pd.Series("", index=analysis.index)).astype(str).str.upper()
-    auto_units = total_bolus.where(src.str_contains("AUTO_INSULIN", na=False), 0).sum()
-    ac_pct = (auto_units/total_bolus.sum()*100) if total_bolus.sum() else np.nan
-    with c4: st.metric("Auto-corrections (% bolus)", f"{ac_pct:.2f}%" if pd.notna(ac_pct) else "—")
+
+    # make sure we always have a string Series, even if the column is missing
+    if "Bolus Source" in analysis.columns:
+        src = analysis["Bolus Source"].astype(str).str.upper()
+    else:
+        src = pd.Series("", index=analysis.index)
+
+    auto_units = total_bolus.where(src.str.contains("AUTO_INSULIN", na=False), 0).sum()
+    ac_pct = (auto_units / total_bolus.sum() * 100) if total_bolus.sum() else np.nan
+
+    with c4:
+        st.metric("Auto-corrections (% bolus)", f"{ac_pct:.2f}%" if pd.notna(ac_pct) else "—")
 else:
-    with c4: st.info("No bolus data detected.")
+    with c4:
+        st.info("No bolus data detected.")
+
 
 st.divider()
 
