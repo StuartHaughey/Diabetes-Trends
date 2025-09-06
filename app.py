@@ -1,6 +1,7 @@
-# app.py — Diabetes Trends with One-Page PDF Export
-# New: Export to PDF (one page) with toggle to include short commentary.
-# Keeps: 3/6/12/all windows, 2dp formatting, colour rules, Month/Hour first, no inner scroll, persistence.
+# app.py — Diabetes Trends with One-Page PDF Export (robust month parsing)
+# Works with CareLink CSV/TSV. Mobile-friendly. AU mmol/L units.
+# Features: 3/6/12/all windows, guideline/personal colouring, 2dp tables,
+# persistence, best-practice explainer, PDF export with optional commentary.
 
 import io, os, re, tempfile
 import numpy as np
@@ -8,7 +9,7 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
-# For PDF & charts used in PDF (graceful fallback if not installed)
+# ---- PDF deps (optional; guarded) ----
 PDF_AVAILABLE = True
 PDF_IMPORT_ERROR = ""
 try:
@@ -24,14 +25,13 @@ except Exception as _e:
     PDF_AVAILABLE = False
     PDF_IMPORT_ERROR = str(_e)
 
-
 st.set_page_config(page_title="Diabetes Trends", layout="wide")
 st.title("📊 Diabetes Trends (CareLink CSV/TSV uploads)")
 
 STORE_PATH = "data_store.csv.gz"
-DATA_START = pd.Timestamp("2024-01-01")  # ignore anything before this when loading
+DATA_START = pd.Timestamp("2024-01-01")  # ignore anything earlier on load
 
-# ---------- small helpers ----------
+# ---------- helpers ----------
 def df_auto_height(df: pd.DataFrame, row_px: int = 33, header_px: int = 42, max_px: int = 1800) -> int:
     return min(max_px, header_px + row_px * (len(df) + 1))
 
@@ -207,7 +207,6 @@ else:
     with c1: st.info("No CGM values detected.")
 if "Bolus" in analysis.columns:
     total_bolus = pd.to_numeric(analysis["Bolus"], errors="coerce").fillna(0)
-    # robust Bolus Source handling
     if "Bolus Source" in analysis.columns:
         src = analysis["Bolus Source"].astype(str).str.upper()
     else:
@@ -423,6 +422,20 @@ st.caption(
 #        PDF EXPORT
 # =========================
 
+# Robust month converter for Period or strings like 'Jan-2024' / '2024-01'
+def _month_series_to_datetime(mser: pd.Series) -> pd.Series:
+    if pd.api.types.is_period_dtype(mser):
+        return mser.dt.to_timestamp()
+    s = mser.astype(str).str.strip()
+    for fmt in ("%b-%Y", "%Y-%m", "%Y-%m-%d"):
+        try:
+            dt = pd.to_datetime(s, format=fmt)
+            if dt.notna().any():
+                return dt
+        except Exception:
+            pass
+    return pd.to_datetime(s, errors="coerce")
+
 def _mini_tir_line_png(monthly_df: pd.DataFrame) -> str:
     if not len(monthly_df): return ""
     fig, ax = plt.subplots(figsize=(6, 2.4), dpi=150)
@@ -448,51 +461,37 @@ def _mini_mean_line_png(monthly_df: pd.DataFrame) -> str:
     return tmp.name
 
 def _hourly_tir_bar_png(hourly_df: pd.DataFrame) -> str:
-    """Return path to a PNG bar chart of hourly Time in Range %."""
     if not len(hourly_df): return ""
     fig, ax = plt.subplots(figsize=(6, 2.4), dpi=150)
     ax.bar(hourly_df["hour"], hourly_df["Time in Range %"], width=0.8)
-    ax.set_ylim(0, 100)
-    ax.set_xlabel("Hour")
-    ax.set_ylabel("TIR %")
-    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_ylim(0, 100); ax.set_xlabel("Hour"); ax.set_ylabel("TIR %"); ax.grid(True, axis="y", alpha=0.3)
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    fig.tight_layout()
-    fig.savefig(tmp.name, bbox_inches="tight")
-    plt.close(fig)
+    fig.tight_layout(); fig.savefig(tmp.name, bbox_inches="tight"); plt.close(fig)
     return tmp.name
 
 def _generate_commentary(monthly_df: pd.DataFrame, hourly_df: pd.DataFrame) -> list[str]:
-    """Very short bullet points based on simple rules."""
     notes = []
     if len(monthly_df) >= 2:
-        last = monthly_df.iloc[-1]
-        prev = monthly_df.iloc[-2]
-        if pd.notna(last["TIR %"]) and pd.notna(prev["TIR %"]):
-            delta = last["TIR %"] - prev["TIR %"]
-            if abs(delta) >= 2:
-                direction = "up" if delta > 0 else "down"
-                notes.append(f"TIR {direction} {delta:.1f} pp vs previous month.")
-        if pd.notna(last["Mean SG (mmol/L)"]) and pd.notna(prev["Mean SG (mmol/L)"]):
+        last, prev = monthly_df.iloc[-1], monthly_df.iloc[-2]
+        if pd.notna(last.get("TIR %")) and pd.notna(prev.get("TIR %")):
+            d = last["TIR %"] - prev["TIR %"]
+            if abs(d) >= 2: notes.append(f"TIR {'up' if d>0 else 'down'} {d:.1f} pp vs previous month.")
+        if pd.notna(last.get("Mean SG (mmol/L)")) and pd.notna(prev.get("Mean SG (mmol/L)")):
             d2 = last["Mean SG (mmol/L)"] - prev["Mean SG (mmol/L)"]
-            if abs(d2) >= 0.2:
-                direction = "higher" if d2 > 0 else "lower"
-                notes.append(f"Mean SG {direction} by {abs(d2):.2f} mmol/L vs previous month.")
-    # guideline flags
+            if abs(d2) >= 0.2: notes.append(f"Mean SG {'higher' if d2>0 else 'lower'} by {abs(d2):.2f} mmol/L vs previous month.")
     if len(monthly_df):
         cur = monthly_df.iloc[-1]
         if pd.notna(cur.get("TBR % (<3.0)", np.nan)) and cur["TBR % (<3.0)"] > 1:
-            notes.append("Time below 3.0 mmol/L above the 1% guideline — review overnight and pre-exercise lows.")
+            notes.append("Time below 3.0 mmol/L above 1% guideline — check overnight and pre-exercise lows.")
         if pd.notna(cur.get("TAR % (>13.9)", np.nan)) and cur["TAR % (>13.9)"] > 5:
-            notes.append("Severe hyper (>13.9 mmol/L) above the 5% guideline — check meal timing/bolus strategy.")
+            notes.append("Severe hyper (>13.9 mmol/L) above 5% guideline — review meal timing/bolus strategy.")
         if pd.notna(cur.get("TIR %", np.nan)) and cur["TIR %"] < 70:
-            notes.append("TIR below the ≥70% guideline — focus on post-meal control and basal alignment.")
-    # hourly hotspots
+            notes.append("TIR below ≥70% guideline — focus on post-meal control and basal alignment.")
     if len(hourly_df):
-        worst_hour = hourly_df.sort_values("Time in Range %").iloc[0]
-        if worst_hour["Time in Range %"] < 60:
-            notes.append(f"Lowest TIR hour: {int(worst_hour['hour']):02d}:00 (~{worst_hour['Time in Range %']:.0f}%).")
-    return notes[:4]  # keep it tight
+        worst = hourly_df.sort_values("Time in Range %").iloc[0]
+        if worst["Time in Range %"] < 60:
+            notes.append(f"Lowest TIR hour: {int(worst['hour']):02d}:00 (~{worst['Time in Range %']:.0f}%).")
+    return notes[:4]
 
 def build_pdf(patient: str, window_label: str, monthly_df: pd.DataFrame, hourly_df: pd.DataFrame, include_comments: bool) -> bytes:
     buf = io.BytesIO()
@@ -501,25 +500,22 @@ def build_pdf(patient: str, window_label: str, monthly_df: pd.DataFrame, hourly_
     styles.add(ParagraphStyle(name="Tiny", fontSize=8, leading=10))
     story = []
 
-    title = Paragraph(f"<b>{patient} — Diabetes Summary</b>", styles["Title"])
-    sub = Paragraph(f"<i>{window_label}</i>", styles["Normal"])
-    story += [title, sub, Spacer(1, 6)]
+    story += [Paragraph(f"<b>{patient} — Diabetes Summary</b>", styles["Title"]),
+              Paragraph(f"<i>{window_label}</i>", styles["Normal"]),
+              Spacer(1, 6)]
 
-    # Key metrics row (use last month if available)
+    # Key metrics row (latest month if present)
     key_rows = []
     if len(monthly_df):
         last = monthly_df.iloc[-1]
-        def fmt(v, pct=False): 
-            if pd.isna(v): return "—"
-            return f"{v:.2f}%" if pct else f"{v:.2f}"
+        fmt = lambda v, pct=False: "—" if pd.isna(v) else (f"{v:.2f}%" if pct else f"{v:.2f}")
         key_rows = [
             ["Mean SG (mmol/L)", fmt(last.get("Mean SG (mmol/L)"))],
-            ["GMI (%)", fmt(last.get("GMI %"), pct=True)],
-            ["TIR %", fmt(last.get("TIR %"), pct=True)],
-            ["TBR % (<3.0)", fmt(last.get("TBR % (<3.0)"), pct=True)],
-            ["TAR % (>13.9)", fmt(last.get("TAR % (>13.9)"), pct=True)],
+            ["GMI (%)",          fmt(last.get("GMI %"), pct=True)],
+            ["TIR %",            fmt(last.get("TIR %"), pct=True)],
+            ["TBR % (<3.0)",     fmt(last.get("TBR % (<3.0)"), pct=True)],
+            ["TAR % (>13.9)",    fmt(last.get("TAR % (>13.9)"), pct=True)],
         ]
-    if key_rows:
         t = Table(key_rows, colWidths=[6*cm, 3*cm])
         t.setStyle(TableStyle([
             ("FONT", (0,0), (-1,-1), "Helvetica", 9),
@@ -530,24 +526,21 @@ def build_pdf(patient: str, window_label: str, monthly_df: pd.DataFrame, hourly_
         story += [t, Spacer(1, 6)]
 
     # Charts
-    tir_img = _mini_tir_line_png(monthly_df) if len(monthly_df) else ""
+    tir_img  = _mini_tir_line_png(monthly_df) if len(monthly_df) else ""
     mean_img = _mini_mean_line_png(monthly_df) if len(monthly_df) else ""
     hourly_img = _hourly_tir_bar_png(hourly_df) if len(hourly_df) else ""
 
-    img_w = 8.5*cm
     row = []
-    if tir_img: row.append(Image(tir_img, width=img_w, height=3.3*cm))
-    if mean_img: row.append(Image(mean_img, width=img_w, height=3.3*cm))
+    if tir_img:  row.append(Image(tir_img,  width=8.5*cm, height=3.3*cm))
+    if mean_img: row.append(Image(mean_img, width=8.5*cm, height=3.3*cm))
     if row:
-        tbl = Table([[*row]])
-        tbl.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP")]))
+        tbl = Table([row]); tbl.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP")]))
         story += [tbl, Spacer(1, 4)]
     if hourly_img:
         story += [Paragraph("<b>Hourly Time in Range</b>", styles["Normal"]),
                   Image(hourly_img, width=17.5*cm, height=4.2*cm),
                   Spacer(1, 6)]
 
-    # Optional commentary
     if include_comments:
         notes = _generate_commentary(monthly_df, hourly_df)
         if notes:
@@ -556,13 +549,11 @@ def build_pdf(patient: str, window_label: str, monthly_df: pd.DataFrame, hourly_
                 story += [Paragraph(f"• {n}", styles["Normal"])]
             story += [Spacer(1, 6)]
 
-    # Footnote
-    foot = Paragraph(
-        "Benchmarks from International Consensus on Time in Range (2019): "
-        "TIR ≥70%, TAR 10–13.9 <25%, TAR >13.9 <5%, TBR 3.0–3.9 <4%, TBR <3.0 <1%.",
+    story += [Paragraph(
+        "Benchmarks: TIR ≥70%, TAR 10–13.9 <25%, TAR >13.9 <5%, TBR 3.0–3.9 <4%, TBR <3.0 <1% "
+        "(International Consensus on Time in Range, 2019).",
         styles["Tiny"]
-    )
-    story += [Spacer(1, 4), foot]
+    )]
 
     doc.build(story)
     return buf.getvalue()
@@ -576,19 +567,18 @@ if have_sg:
         **{"Time in Range %": ("SG", lambda s: ((s>=3.9)&(s<=10.0)).mean()*100)}
     ).reset_index().round(2)
 
-# ---------- export button ----------
+# ---------- export UI ----------
 st.subheader("Doctor export")
-
 if not PDF_AVAILABLE:
     st.info(
-        "PDF export is temporarily unavailable on this deployment. "
-        "Install dependencies and redeploy: `matplotlib` and `reportlab`."
+        "PDF export is unavailable on this deployment. Install and redeploy: "
+        "`matplotlib` and `reportlab`."
     )
 else:
     col_a, _ = st.columns([1,3])
     with col_a:
         if st.button("🧾 Generate one-page PDF"):
-            # was: monthly_for_pdf = monthly_display.copy()
-monthly_for_pdf = monthly.copy()
+            # Use RAW monthly (with Period month) for robust date handling in images
+            monthly_for_pdf = monthly.copy()
             pdf_bytes = build_pdf(patient_name, window_label, monthly_for_pdf, hourly_export, include_comments)
             st.download_button("Download PDF", data=pdf_bytes, file_name="diabetes_summary.pdf", mime="application/pdf")
