@@ -357,7 +357,6 @@ def _compare_windows(monthly_df: pd.DataFrame, n: int):
     """Return (prior_df, curr_df, metrics_df) for n-month comparison; None if not enough data."""
     if len(monthly_df) < 2*n:
         return None
-    # Work on a copy sorted by month
     m = monthly_df.sort_values("month").copy()
     prior = m.iloc[-2*n:-n]
     curr  = m.iloc[-n:]
@@ -365,25 +364,28 @@ def _compare_windows(monthly_df: pd.DataFrame, n: int):
     def mean_or_nan(df, col):
         return pd.to_numeric(df[col], errors="coerce").mean() if col in df.columns else np.nan
 
-    # Key metrics
     metrics = [
-        ("Mean SG (mmol/L)", False),
-        ("TIR %", True),
-        ("TBR % (<3.0)", True),
-        ("TAR % (>13.9)", True),
+        ("Mean SG (mmol/L)", False, "lower_better"),
+        ("TIR %",             True,  "higher_better"),
+        ("TBR % (<3.0)",      True,  "lower_better"),
+        ("TAR % (>13.9)",     True,  "lower_better"),
     ]
     rows = []
-    for col, is_pct in metrics:
+    for col, is_pct, better in metrics:
         p = mean_or_nan(prior, col)
         c = mean_or_nan(curr, col)
-        delta = c - p
-        rows.append((col, p, c, delta, is_pct))
-    result = pd.DataFrame(rows, columns=["Metric","Prior","Current","Δ (Curr-Prior)","is_pct"])
+        delta = c - p  # current minus prior
+        rows.append((col, c, p, delta, is_pct, better))
+    result = pd.DataFrame(rows, columns=["Metric","Current","Prior","Δ (Curr-Prior)","is_pct","better"])
     return prior, curr, result
 
 def _fmt_metric(value, is_pct=False):
     if pd.isna(value): return "—"
     return f"{value:.2f}%" if is_pct else f"{value:.2f}"
+
+def _delta_mode(better: str) -> str:
+    # st.metric: "normal" => positive is green; "inverse" => negative is green
+    return "normal" if better == "higher_better" else "inverse"
 
 def _show_comp(n: int):
     out = _compare_windows(monthly, n)
@@ -392,55 +394,55 @@ def _show_comp(n: int):
         return
     prior, curr, dfm = out
 
-    # Metrics row
+    # Metrics row (Current first, momentum colours)
     c1, c2, c3, c4 = st.columns(4)
-    targets = [
-        ("Mean SG (mmol/L)", c1, False),
-        ("TIR %",             c2, True),
-        ("TBR % (<3.0)",      c3, True),
-        ("TAR % (>13.9)",     c4, True),
-    ]
-    for name, col, is_pct in targets:
+    for name, col in [
+        ("Mean SG (mmol/L)", c1),
+        ("TIR %",            c2),
+        ("TBR % (<3.0)",     c3),
+        ("TAR % (>13.9)",    c4),
+    ]:
         row = dfm[dfm["Metric"] == name].iloc[0]
         with col:
             st.metric(
                 label=name,
-                value=_fmt_metric(row["Current"], is_pct),
-                delta=_fmt_metric(row["Δ (Curr-Prior)"], is_pct),
-                delta_color="normal"  # green for up/down is subjective; keep neutral
+                value=_fmt_metric(row["Current"], bool(row["is_pct"])),
+                delta=_fmt_metric(row["Δ (Curr-Prior)"], bool(row["is_pct"])),
+                delta_color=_delta_mode(row["better"])
             )
 
-    # Bar: TIR % prior vs current
+    # Bar: TIR % Last n vs Prior n (Current first)
     if "TIR %" in curr.columns:
         dplot = pd.DataFrame({
-            "Window": [f"Prior {n}", f"Last {n}"],
-            "TIR %": [pd.to_numeric(prior["TIR %"], errors="coerce").mean(),
-                      pd.to_numeric(curr["TIR %"], errors="coerce").mean()]
+            "Window": [f"Last {n}", f"Prior {n}"],
+            "TIR %": [
+                pd.to_numeric(curr["TIR %"], errors="coerce").mean(),
+                pd.to_numeric(prior["TIR %"], errors="coerce").mean()
+            ]
         })
         st.altair_chart(
             alt.Chart(dplot).mark_bar().encode(
-                x=alt.X("Window:N", title=None),
+                x=alt.X("Window:N", title=None, sort=dplot["Window"].tolist()),
                 y=alt.Y("TIR %:Q", title="TIR %", scale=alt.Scale(domain=[0,100])),
                 tooltip=[alt.Tooltip("TIR %:Q", format=".2f")]
-            ).properties(height=220, title=f"TIR % — Prior {n} vs Last {n}"),
+            ).properties(height=220, title=f"TIR % — Last {n} vs Prior {n}"),
             use_container_width=True
         )
 
-    # Tiny table with numbers
-    tidy = dfm[["Metric","Prior","Current","Δ (Curr-Prior)"]].copy()
-    # Format numbers to 2 dp for display
-    for col in ["Prior","Current","Δ (Curr-Prior)"]:
-        # find if metric is pct
+    # Tiny table (Current, Prior, Δ) with 2-dp formatting
+    tidy = dfm[["Metric","Current","Prior","Δ (Curr-Prior)"]].copy()
+    for col in ["Current","Prior","Δ (Curr-Prior)"]:
         tidy[col] = [
             _fmt_metric(v, bool(dfm.loc[i, "is_pct"])) for i, v in enumerate(dfm[col].values)
         ]
-    st.dataframe(tidy, use_container_width=True, hide_index=True, height= df_auto_height(tidy))
+    st.dataframe(tidy, use_container_width=True, hide_index=True, height=df_auto_height(tidy))
 
 # Tabs for 3/6/12 month comparisons
-t3, t6, t12 = st.tabs([ "Last 3 vs prior 3", "Last 6 vs prior 6", "Last 12 vs prior 12" ])
+t3, t6, t12 = st.tabs(["Last 3 vs prior 3", "Last 6 vs prior 6", "Last 12 vs prior 12"])
 with t3:  _show_comp(3)
 with t6:  _show_comp(6)
 with t12: _show_comp(12)
+
 
 # ---------- hourly pattern ----------
 st.subheader("Hour-of-day pattern (combined)")
