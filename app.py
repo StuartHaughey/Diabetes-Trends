@@ -101,12 +101,16 @@ benchmark_mode = st.sidebar.radio("Colour-coding against:", ["Best practice (gui
 personal_band = st.sidebar.slider("Personal band (± percentage points)", 2, 10, 5)
 show_samples = st.sidebar.toggle("Show hourly 'Samples' column", value=False)
 
+# ---------- sidebar ----------
+# ... your earlier sidebar code ...
+
 st.sidebar.header("Analysis window")
 analysis_mode = st.sidebar.radio(
     "Use data from:",
-    ["Last 12 months (rolling)", "All available data"],
-    index=0
+    ["Last 3 months", "Last 6 months", "Last 12 months (rolling)", "All available data"],
+    index=2
 )
+
 
 # ---------- load data ----------
 if use_stored and stored is not None:
@@ -145,23 +149,27 @@ if "dt" not in data.columns or data["dt"].isna().all():
 
 # ---------- apply analysis window ----------
 latest_dt = pd.to_datetime(data["dt"]).max()
-if analysis_mode.startswith("Last 12"):
-    cutoff = (latest_dt - pd.Timedelta(days=365)).normalize()
-    analysis = data[data["dt"] >= cutoff].copy()
-else:
-    cutoff = data["dt"].min().normalize()
-    analysis = data.copy()
+
+def window_start(mode: str, latest: pd.Timestamp) -> pd.Timestamp:
+    if mode.startswith("Last 3"):  return (latest - pd.Timedelta(days=90)).normalize()
+    if mode.startswith("Last 6"):  return (latest - pd.Timedelta(days=182)).normalize()
+    if mode.startswith("Last 12"): return (latest - pd.Timedelta(days=365)).normalize()
+    return data["dt"].min().normalize()
+
+cutoff = window_start(analysis_mode, latest_dt)
+analysis = data.copy() if analysis_mode.startswith("All") else data[data["dt"] >= cutoff].copy()
+
+# For titles/subtext
+window_label = (
+    "All data"
+    if analysis_mode.startswith("All")
+    else f"{analysis_mode} (from {cutoff.date()} to {latest_dt.date()})"
+)
 
 # Sidebar hint of effective range
 earliest_dt = pd.to_datetime(analysis["dt"]).min().date()
-latest_dt_display = latest_dt.date()
-st.sidebar.caption(f"Analysing: **{earliest_dt} → {latest_dt_display}**")
+st.sidebar.caption(f"Analysing: **{earliest_dt} → {latest_dt.date()}**")
 
-# Persisted dataset option
-if not use_stored and st.button("💾 Save as current dataset"):
-    save_store(data); st.success("Saved. Mobile will load this dataset automatically.")
-
-st.divider()
 
 # ---------- metrics ----------
 sg = pd.to_numeric(analysis.get("SG"), errors="coerce")
