@@ -3,6 +3,24 @@
 # Features: 3/6/12/all windows, guideline/personal colouring, 2dp tables,
 # persistence, best-practice explainer, PDF export with optional commentary.
 
+# app.py (top of file, before heavy imports or data loads)
+import streamlit as st
+
+# Fast path for keep-alive pings: https://your-app.streamlit.app/?ping=1
+if st.query_params.get("ping") == "1":
+    st.write("ok")
+    st.stop()
+import pandas as pd
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_data():
+    # fetch from your external source (Supabase/Postgres/S3 etc.)
+    # return a DataFrame or your parsed model
+    return pd.DataFrame()
+
+data = load_data()
+
+
 import io, os, re, tempfile
 import numpy as np
 import pandas as pd
