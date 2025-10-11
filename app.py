@@ -1,4 +1,5 @@
 # app.py — Diabetes Trends (CareLink multi-section CSVs via GitHub)
+# v7: adds cleaning + metrics + TIR by month + hourly profile
 
 import os
 import re
@@ -46,7 +47,7 @@ def parse_month_to_date(mmm_yyyy: str) -> datetime:
 
 @st.cache_resource
 def get_status():
-    return {"app_start": datetime.now(timezone.utc), "last_refresh": None, "version": "v6"}
+    return {"app_start": datetime.now(timezone.utc), "last_refresh": None, "version": "v7"}
 
 def fmt_dt(dt_utc):
     if not dt_utc:
@@ -70,6 +71,8 @@ GLUCOSE_CANDIDATES = [
     "SG (mmol/L)",
     "SG (mg/dL)",
 ]
+DATE_COL = "Date"
+TIME_COL = "Time"
 
 # ──────────────────────────────────────────────────────────────
 # 3) Data loaders
@@ -89,36 +92,30 @@ def load_index() -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("month_date").reset_index(drop=True)
 
 def _first_300_lines(url: str) -> list[str]:
-    """Fetch and return the first ~300 lines as plain text (handles BOM)."""
     with urlopen(url) as resp:
         text = resp.read().decode("utf-8-sig", errors="replace")
     lines = text.splitlines()
     return lines[:300]
 
 def _find_header_row(url: str) -> int:
-    """Find the line number that begins the real data header (Index,Date,Time,...)"""
     lines = _first_300_lines(url)
     for i, line in enumerate(lines):
         if line.startswith(HEADER_PREFIX):
             return i
-    # As a fallback, pick the first line that contains both Date and Time
     for i, line in enumerate(lines):
         if "Date" in line and "Time" in line and line.startswith("Index"):
             return i
-    # Worst case: top of file (shouldn't happen with CareLink)
     return 0
 
 @st.cache_data(ttl=3600)
 def load_month_csv(filename: str) -> pd.DataFrame:
+    """Load a single month, reading only the time-series table."""
     clean = str(filename).strip()
     url = RAW_BASE + quote(clean)
     if DEBUG: st.code(f"Fetching: {url}")
 
     header_row = _find_header_row(url)
 
-    # Read file starting from the detected header row
-    # Use skiprows=header_row to skip exactly that many lines,
-    # then header=0 to treat the next line as the header.
     df = pd.read_csv(
         url,
         skiprows=header_row,
@@ -135,17 +132,17 @@ def load_month_csv(filename: str) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
 
     # Keep rows that have Date & Time
-    if "Date" in df.columns and "Time" in df.columns:
-        df = df[df["Date"].notna() & df["Time"].notna()]
+    if DATE_COL in df.columns and TIME_COL in df.columns:
+        df = df[df[DATE_COL].notna() & df[TIME_COL].notna()]
 
     # Month label
     df["month"] = extract_month_str(clean)
 
     # Datetime (AEST)
-    if "Date" in df.columns and "Time" in df.columns:
+    if DATE_COL in df.columns and TIME_COL in df.columns:
         try:
             dt = pd.to_datetime(
-                df["Date"].astype(str) + " " + df["Time"].astype(str),
+                df[DATE_COL].astype(str) + " " + df[TIME_COL].astype(str),
                 errors="coerce",
                 dayfirst=True,
             )
@@ -173,7 +170,78 @@ def load_all_months(meta: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 # ──────────────────────────────────────────────────────────────
-# 4) Sidebar + UI
+# 4) Cleaning + metrics
+# ──────────────────────────────────────────────────────────────
+def pick_glucose_column(df: pd.DataFrame) -> str | None:
+    for g in GLUCOSE_CANDIDATES:
+        if g in df.columns:
+            return g
+    return None
+
+def clean_glucose(df: pd.DataFrame, glu_col: str) -> pd.DataFrame:
+    out = df.copy()
+    # Convert common "None" strings to NaN then numeric
+    out[glu_col] = pd.to_numeric(out[glu_col].replace("None", pd.NA), errors="coerce")
+    # Drop rows with no timestamp or no glucose
+    if "dt" in out.columns:
+        out = out[out["dt"].notna()]
+    out = out[out[glu_col].notna()]
+    # Keep obviously valid physiologic range for mmol/L/mg/dL
+    if "mmol/L" in glu_col:
+        out = out[(out[glu_col] >= 1.5) & (out[glu_col] <= 33)]
+    else:
+        # mg/dL
+        out = out[(out[glu_col] >= 30) & (out[glu_col] <= 600)]
+        # convert to mmol/L for unified analysis
+        out["glucose_mmol"] = out[glu_col] / 18.0
+        return out.rename(columns={"glucose_mmol": "glucose"})
+    out = out.rename(columns={glu_col: "glucose"})
+    return out
+
+def compute_metrics(df: pd.DataFrame, lower: float, upper: float) -> dict:
+    if df.empty or "glucose" not in df.columns:
+        return {}
+    g = df["glucose"]
+    n = len(g)
+    mean = g.mean()
+    median = g.median()
+    tir = (g.between(lower, upper)).mean() * 100
+    low = (g < lower).mean() * 100
+    high = (g > upper).mean() * 100
+    # HbA1c estimate (NGSP): HbA1c% = (eAG_mgdl + 46.7) / 28.7 ; eAG_mgdl = mean_mmol * 18
+    eAG_mgdl = mean * 18.0
+    hba1c_pct = (eAG_mgdl + 46.7) / 28.7
+    # IFCC mmol/mol (approx): (HbA1c% - 2.15) * 10.929
+    hba1c_ifcc = (hba1c_pct - 2.15) * 10.929
+    return dict(
+        samples=n,
+        mean_mmol=mean,
+        median_mmol=median,
+        tir_pct=tir,
+        low_pct=low,
+        high_pct=high,
+        eAG_mgdl=eAG_mgdl,
+        hba1c_pct=hba1c_pct,
+        hba1c_ifcc=hba1c_ifcc,
+    )
+
+def monthly_tir(df: pd.DataFrame, lower: float, upper: float) -> pd.DataFrame:
+    if df.empty or "glucose" not in df.columns:
+        return pd.DataFrame(columns=["month","TIR %"])
+    grp = df.groupby("month")["glucose"]
+    tir = (grp.apply(lambda s: s.between(lower, upper).mean() * 100)).reset_index(name="TIR %")
+    return tir
+
+def hourly_profile(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "dt" not in df.columns or "glucose" not in df.columns:
+        return pd.DataFrame(columns=["hour","mean_mmol"])
+    temp = df.copy()
+    temp["hour"] = temp["dt"].dt.hour
+    prof = temp.groupby("hour")["glucose"].mean().reset_index(name="mean_mmol")
+    return prof
+
+# ──────────────────────────────────────────────────────────────
+# 5) Sidebar + UI
 # ──────────────────────────────────────────────────────────────
 def render_status_sidebar():
     s = get_status()
@@ -183,6 +251,11 @@ def render_status_sidebar():
     st.sidebar.write(f"Uptime: {human_delta(now - s['app_start'])}")
     st.sidebar.write(f"Last refresh: {fmt_dt(s['last_refresh'])}")
     st.sidebar.caption("Health `?ping=1` • Debug `?debug=1`")
+
+    st.sidebar.markdown("### Targets (mmol/L)")
+    lower = st.sidebar.number_input("Lower", value=3.9, step=0.1, format="%.1f")
+    upper = st.sidebar.number_input("Upper", value=10.0, step=0.1, format="%.1f")
+    return lower, upper
 
 def month_selector(meta: pd.DataFrame):
     months = meta["month"].tolist()
@@ -197,44 +270,73 @@ def month_selector(meta: pd.DataFrame):
         return "all", None
 
 # ──────────────────────────────────────────────────────────────
-# 5) Main app
+# 6) Main app
 # ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Diabetes Trends", layout="wide")
 st.title("Diabetes Trends")
 
-render_status_sidebar()
+lower_target, upper_target = render_status_sidebar()
 meta = load_index()
 
 view_mode, sel_month = month_selector(meta)
 if view_mode == "all":
-    data = load_all_months(meta)
+    raw = load_all_months(meta)
 elif view_mode == "single":
     fname = meta.loc[meta["month"] == sel_month, "file"].iloc[0]
-    data = load_month_csv(fname)
+    raw = load_month_csv(fname)
 else:
     latest = meta["month"].iloc[-1]
     fname = meta.loc[meta["month"] == latest, "file"].iloc[0]
-    data = load_month_csv(fname)
+    raw = load_month_csv(fname)
 
 get_status()["last_refresh"] = datetime.now(timezone.utc)
 
+# Pick & clean glucose
+GLU = pick_glucose_column(raw)
+clean = clean_glucose(raw, GLU) if GLU else pd.DataFrame()
+
 # ──────────────────────────────────────────────────────────────
-# 6) Summary + preview
+# 7) Summary + metrics
 # ──────────────────────────────────────────────────────────────
 st.subheader("Summary")
 st.write(f"Months: **{len(meta)}**, Range: **{meta['month'].iloc[0]} → {meta['month'].iloc[-1]}**")
-st.write(f"Rows loaded: **{len(data)}**")
+st.write(f"Rows loaded (raw): **{len(raw)}** — Clean rows: **{len(clean)}**")
+if GLU:
+    st.caption(f"Glucose column detected: `{GLU}` (converted to mmol/L as `glucose`)")
+
+# Metrics
+metrics = compute_metrics(clean, lower_target, upper_target)
+if metrics:
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Mean (mmol/L)", f"{metrics['mean_mmol']:.1f}")
+    c2.metric("Median (mmol/L)", f"{metrics['median_mmol']:.1f}")
+    c3.metric("Time In Range", f"{metrics['tir_pct']:.0f}%")
+    c4.metric("Low", f"{metrics['low_pct']:.0f}%")
+    c5.metric("High", f"{metrics['high_pct']:.0f}%")
+    c6, c7 = st.columns(2)
+    c6.metric("eAG (mg/dL)", f"{metrics['eAG_mgdl']:.0f}")
+    c7.metric("HbA1c (NGSP % / IFCC mmol/mol)",
+              f"{metrics['hba1c_pct']:.1f}%  /  {metrics['hba1c_ifcc']:.0f}")
 
 st.divider()
 st.subheader("Raw preview (first 200 rows)")
-st.dataframe(data.head(200), use_container_width=True)
+st.dataframe(raw.head(200), use_container_width=True)
 
 # ──────────────────────────────────────────────────────────────
-# 7) Simple glucose chart if present
+# 8) Charts
 # ──────────────────────────────────────────────────────────────
-GLU = next((g for g in GLUCOSE_CANDIDATES if g in data.columns), None)
-if GLU and "dt" in data.columns:
-    st.subheader(f"Glucose over time — {GLU}")
-    st.line_chart(data[["dt", GLU]].set_index("dt"))
+if not clean.empty and "dt" in clean.columns:
+    st.subheader("Glucose over time")
+    st.line_chart(clean[["dt", "glucose"]].set_index("dt"))
+
+    st.subheader("Hourly profile (mean mmol/L)")
+    prof = hourly_profile(clean)
+    if not prof.empty:
+        st.bar_chart(prof.set_index("hour")["mean_mmol"])
+
+    st.subheader("Monthly Time-in-Range (%)")
+    tir = monthly_tir(clean, lower_target, upper_target)
+    if not tir.empty:
+        st.bar_chart(tir.set_index("month")["TIR %"])
 else:
-    st.caption("Glucose column not found yet — once confirmed, we’ll add proper diabetes charts.")
+    st.info("No cleaned glucose rows yet — check the detected glucose column or targets.")
