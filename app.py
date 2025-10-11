@@ -76,49 +76,72 @@ def load_index():
     meta = pd.DataFrame(meta).sort_values("month_date").reset_index(drop=True)
     return meta
 
-@st.cache_data(ttl=3600)
-def load_month_csv(fname: str) -> pd.DataFrame:
-    """Fetch one month’s CSV, tolerate inconsistent formatting."""
-    url = RAW_BASE + quote(fname.strip())
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_month_csv(filename: str) -> pd.DataFrame:
+    """
+    Robust loader for CareLink/780G exports.
+    - Finds the real header row (starts with 'Index,Date,Time').
+    - Reads with comma separator, skips malformed lines.
+    """
+    clean = str(filename).strip()
+    url = RAW_BASE + quote(clean)
+
     if DEBUG:
         st.code(f"Fetching: {url}")
 
-    attempts = [
-        dict(sep=None, engine="python"),
-        dict(sep=",", engine="python"),
-        dict(sep="\t", engine="python"),
-        dict(sep=";", engine="python"),
-        dict(sep=None, engine="python", encoding="utf-8-sig"),
-    ]
+    # 1) Peek the first 100 lines to locate the true header row
+    sample = pd.read_csv(
+        url,
+        header=None,
+        sep=",",
+        engine="python",
+        nrows=100,
+        on_bad_lines="skip",
+        encoding="utf-8-sig",
+    )
 
-    df = None
-    used_opts = None
-    last_err = None
-
-    for opts in attempts:
-        try:
-            df = pd.read_csv(url, on_bad_lines="skip", **opts)
-            if df.shape[1] == 1 or all(str(c).startswith("Unnamed") for c in df.columns):
-                raise ValueError("delimiter guess failed")
-            used_opts = opts
+    # header row is the first row whose first 3 cells match 'Index','Date','Time'
+    header_row = None
+    for i, row in sample.iterrows():
+        # be defensive about NA/None
+        first = str(row.iloc[0]).strip() if len(row) > 0 else ""
+        second = str(row.iloc[1]).strip() if len(row) > 1 else ""
+        third = str(row.iloc[2]).strip() if len(row) > 2 else ""
+        if first == "Index" and second == "Date" and third == "Time":
+            header_row = i
             break
-        except Exception as e:
-            last_err = e
-            df = None
 
-    if df is None:
-        st.error(f"Failed to parse file: {fname}")
-        st.code(url)
-        st.exception(last_err)
-        raise RuntimeError(f"Could not parse {fname}")
+    if header_row is None:
+        # Fallback: pick the row with the most non-null entries
+        header_row = sample.count(axis=1).idxmax()
+
+    # 2) Read full file using that header row
+    df = pd.read_csv(
+        url,
+        sep=",",
+        engine="python",
+        header=header_row,
+        on_bad_lines="skip",
+        encoding="utf-8-sig",
+        quotechar='"'
+    )
+
+    # 3) Basic tidy-up
+    # drop completely-empty columns
+    df = df.dropna(axis=1, how="all")
+    # strip column names
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # 4) Tag month from filename
+    df["month"] = extract_month_str(clean)
 
     if DEBUG:
-        st.write("Detected delimiter:", used_opts.get("sep") if used_opts else "?")
-        st.write("Columns detected:", list(df.columns))
-        st.dataframe(df.head())
+        st.write(f"Header row detected: {header_row}")
+        st.write("Columns:", list(df.columns)[:12])
+        st.dataframe(df.head(10))
 
-    df["month"] = extract_month(fname)
     return df
+
 
 @st.cache_data(ttl=3600)
 def load_all_months(meta: pd.DataFrame) -> pd.DataFrame:
