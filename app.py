@@ -1,4 +1,4 @@
-# app.py — Diabetes Trends (CareLink 780G Time-Series Parser)
+# app.py — Diabetes Trends (CareLink multi-section CSVs via GitHub)
 
 import os
 import re
@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 
 # ──────────────────────────────────────────────────────────────
-# 0. Keep-alive + debug
+# 0) Query params (keep-alive + debug)
 # ──────────────────────────────────────────────────────────────
 qp = st.experimental_get_query_params()
 if qp.get("ping") in (["1"], "1"):
@@ -19,18 +19,19 @@ if qp.get("ping") in (["1"], "1"):
 DEBUG = qp.get("debug") in (["1"], "1")
 
 # ──────────────────────────────────────────────────────────────
-# 1. Config
+# 1) Config
 # ──────────────────────────────────────────────────────────────
-GITHUB_USER = "stuarthaughey"
-DATA_REPO   = "diabetes-data"
-BRANCH      = "main"
+GITHUB_USER = os.getenv("DATA_GITHUB_USER", "stuarthaughey")
+DATA_REPO   = os.getenv("DATA_REPO_NAME", "diabetes-data")
+BRANCH      = os.getenv("DATA_REPO_BRANCH", "main")
 RAW_BASE    = f"https://raw.githubusercontent.com/{GITHUB_USER}/{DATA_REPO}/{BRANCH}/"
-SYD_TZ      = ZoneInfo("Australia/Sydney")
+
+SYD_TZ = ZoneInfo("Australia/Sydney")
 
 # ──────────────────────────────────────────────────────────────
-# 2. Helpers
+# 2) Helpers
 # ──────────────────────────────────────────────────────────────
-MONTH_PATTERN = re.compile(r"([A-Za-z]{3}-\d{4})\.csv$")
+MONTH_PATTERN = re.compile(r"([A-Za-z]{3}-\d{4})\.csv$")  # e.g. "Sep-2025"
 
 def extract_month_str(fname: str) -> str:
     m = MONTH_PATTERN.search(str(fname).strip())
@@ -43,7 +44,7 @@ def parse_month_to_date(mmm_yyyy: str) -> datetime:
 
 @st.cache_resource
 def get_status():
-    return {"app_start": datetime.now(timezone.utc), "last_refresh": None, "version": "v4"}
+    return {"app_start": datetime.now(timezone.utc), "last_refresh": None, "version": "v5"}
 
 def fmt_dt(dt_utc):
     if not dt_utc:
@@ -60,79 +61,114 @@ def human_delta(td: timedelta):
     d, h = divmod(h, 24)
     return f"{d}d {h}h"
 
+# Time-series header signature we expect to find
+HEADER_SNIPPET = "Index,Date,Time,New Device Time,BG Source,BG Reading (mmol/L)"
+
+GLUCOSE_CANDIDATES = [
+    "Sensor Glucose (mmol/L)",
+    "Sensor Glucose (mg/dL)",
+    "SG (mmol/L)",
+    "SG (mg/dL)",
+]
+DATE_COL = "Date"
+TIME_COL = "Time"
+
 # ──────────────────────────────────────────────────────────────
-# 3. Data loading
+# 3) Data loaders
 # ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def load_index() -> pd.DataFrame:
     url = RAW_BASE + "index.csv"
     idx = pd.read_csv(url)
+    if "file" not in idx.columns:
+        raise ValueError("index.csv must contain a 'file' column")
     files = [str(x).strip() for x in idx["file"].dropna().tolist()]
     rows = []
     for f in files:
         mstr = extract_month_str(f)
         mdate = parse_month_to_date(mstr)
         rows.append({"file": f, "month": mstr, "month_date": mdate})
-    return pd.DataFrame(rows).sort_values("month_date").reset_index(drop=True)
+    meta = pd.DataFrame(rows).sort_values("month_date").reset_index(drop=True)
+    return meta
 
-# fixed header signature
-HEADER_START = "Index,Date,Time,New Device Time,BG Source,BG Reading (mmol/L)"
+def _find_timeseries_header_row(url: str) -> int:
+    """Scan first ~200 lines for the real data header row."""
+    sample = pd.read_csv(
+        url, header=None, sep=",", engine="python",
+        nrows=200, on_bad_lines="skip", encoding="utf-8-sig"
+    )
+    # 1) Look for our exact signature
+    for i, row in sample.iterrows():
+        cells = ["" if pd.isna(x) else str(x) for x in row.tolist()]
+        joined = ",".join(cells)
+        if HEADER_SNIPPET in joined:
+            return i
+    # 2) Look for a row that begins with Index, Date, Time and includes a glucose column
+    for i, row in sample.iterrows():
+        cells = [str(x).strip() if not pd.isna(x) else "" for x in row.tolist()]
+        if len(cells) >= 3 and cells[0] == "Index" and cells[1] == "Date" and cells[2] == "Time":
+            if any(g in cells for g in GLUCOSE_CANDIDATES):
+                return i
+    # 3) Fallback: row with the most non-null cells
+    return sample.count(axis=1).idxmax()
 
 @st.cache_data(ttl=3600)
 def load_month_csv(filename: str) -> pd.DataFrame:
+    """Load a single month, reading only the time-series table."""
     clean = str(filename).strip()
     url = RAW_BASE + quote(clean)
     if DEBUG: st.code(f"Fetching: {url}")
 
-    # locate header line number
-    with pd.read_csv(url, header=None, sep=",", engine="python", nrows=200,
-                     on_bad_lines="skip", encoding="utf-8-sig") as reader:
-        lines = reader
-    header_row = None
-    for i, row in enumerate(lines.values.tolist()):
-        joined = ",".join(str(x) for x in row)
-        if HEADER_START in joined:
-            header_row = i
-            break
-    if header_row is None:
-        header_row = 0  # fallback
+    header_row = _find_timeseries_header_row(url)
 
-    # load full file starting at header_row
     df = pd.read_csv(
-        url, sep=",", engine="python", header=header_row,
-        on_bad_lines="skip", encoding="utf-8-sig", quotechar='"'
+        url,
+        sep=",",
+        engine="python",
+        header=header_row,
+        on_bad_lines="skip",
+        encoding="utf-8-sig",
+        quotechar='"'
     )
+
+    # Tidy columns and keep only rows that look like time entries
     df = df.dropna(axis=1, how="all")
     df.columns = [str(c).strip() for c in df.columns]
+    if DATE_COL in df.columns and TIME_COL in df.columns:
+        df = df[df[DATE_COL].notna() & df[TIME_COL].notna()]
+
+    # Month label
     df["month"] = extract_month_str(clean)
 
-    # build datetime
-    if "Date" in df.columns and "Time" in df.columns:
-        try:
-            dt = pd.to_datetime(df["Date"].astype(str) + " " + df["Time"].astype(str),
-                                errors="coerce", dayfirst=True)
-            df["dt"] = dt.dt.tz_localize(SYD_TZ, nonexistent="NaT", ambiguous="NaT")
-        except Exception:
-            df["dt"] = pd.NaT
+    # Datetime (AEST)
+    try:
+        dt = pd.to_datetime(
+            df[DATE_COL].astype(str) + " " + df[TIME_COL].astype(str),
+            errors="coerce",
+            dayfirst=True,
+        )
+        df["dt"] = dt.dt.tz_localize(SYD_TZ, nonexistent="NaT", ambiguous="NaT")
+    except Exception:
+        df["dt"] = pd.NaT
 
     if DEBUG:
         st.write(f"Header row detected: {header_row}")
-        st.write("Columns:", list(df.columns)[:14])
-        st.dataframe(df.head(10))
+        st.write("Columns (first 14):", list(df.columns)[:14])
+        st.dataframe(df.head(12))
     return df
 
 @st.cache_data(ttl=3600)
 def load_all_months(meta: pd.DataFrame) -> pd.DataFrame:
     frames = []
-    for f in meta["file"].tolist():
+    for fname in meta["file"].tolist():
         try:
-            frames.append(load_month_csv(f))
+            frames.append(load_month_csv(fname))
         except Exception as e:
-            st.warning(f"Could not load {f}: {e}")
+            st.warning(f"Could not load {fname}: {e}")
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 # ──────────────────────────────────────────────────────────────
-# 4. Sidebar + UI
+# 4) Sidebar + UI
 # ──────────────────────────────────────────────────────────────
 def render_status_sidebar():
     s = get_status()
@@ -157,7 +193,7 @@ def month_selector(meta: pd.DataFrame):
         return "all", None
 
 # ──────────────────────────────────────────────────────────────
-# 5. Main app body
+# 5) Main app
 # ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Diabetes Trends", layout="wide")
 st.title("Diabetes Trends")
@@ -177,22 +213,25 @@ else:
     fname = meta.loc[meta["month"] == latest, "file"].iloc[0]
     data = load_month_csv(fname)
 
+get_status()["last_refresh"] = datetime.now(timezone.utc)
+
 # ──────────────────────────────────────────────────────────────
-# 6. Summary + preview
+# 6) Summary + preview
 # ──────────────────────────────────────────────────────────────
 st.subheader("Summary")
-st.write(f"Months: {len(meta)}, Range: {meta['month'].iloc[0]} → {meta['month'].iloc[-1]}")
-st.write(f"Rows loaded: {len(data)}")
+st.write(f"Months: **{len(meta)}**, Range: **{meta['month'].iloc[0]} → {meta['month'].iloc[-1]}**")
+st.write(f"Rows loaded: **{len(data)}**")
 
 st.divider()
-st.subheader("Raw preview")
+st.subheader("Raw preview (first 200 rows)")
 st.dataframe(data.head(200), use_container_width=True)
 
 # ──────────────────────────────────────────────────────────────
-# 7. Simple chart preview (sensor glucose)
+# 7) Simple glucose chart if present
 # ──────────────────────────────────────────────────────────────
-GLU = "Sensor Glucose (mmol/L)"
-if GLU in data.columns:
-    st.line_chart(data[[ "dt", GLU ]].set_index("dt"))
+GLU = next((g for g in GLUCOSE_CANDIDATES if g in data.columns), None)
+if GLU and "dt" in data.columns:
+    st.subheader(f"Glucose over time — {GLU}")
+    st.line_chart(data[["dt", GLU]].set_index("dt"))
 else:
-    st.caption("Glucose column not yet detected — verify column name.")
+    st.caption("Glucose column not found yet — once we confirm the exact header, we’ll add proper charts.")
