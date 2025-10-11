@@ -10,9 +10,9 @@ import pandas as pd
 import streamlit as st
 
 # ──────────────────────────────────────────────────────────────
-# 0) Keep-alive fast path
+# 0) Query params (use ONLY the experimental API to avoid conflicts)
 # ──────────────────────────────────────────────────────────────
-qp = getattr(st, "query_params", None) or st.experimental_get_query_params()
+qp = st.experimental_get_query_params()
 if qp.get("ping") in (["1"], "1"):
     st.write("ok")
     st.stop()
@@ -21,16 +21,17 @@ DEBUG = qp.get("debug") in (["1"], "1")
 # ──────────────────────────────────────────────────────────────
 # 1) Config
 # ──────────────────────────────────────────────────────────────
-GITHUB_USER = "stuarthaughey"
-DATA_REPO   = "diabetes-data"
-BRANCH      = "main"
+GITHUB_USER = os.getenv("DATA_GITHUB_USER", "stuarthaughey")
+DATA_REPO   = os.getenv("DATA_REPO_NAME", "diabetes-data")
+BRANCH      = os.getenv("DATA_REPO_BRANCH", "main")
 RAW_BASE    = f"https://raw.githubusercontent.com/{GITHUB_USER}/{DATA_REPO}/{BRANCH}/"
-SYD_TZ      = ZoneInfo("Australia/Sydney")
+
+SYD_TZ = ZoneInfo("Australia/Sydney")
 
 # ──────────────────────────────────────────────────────────────
 # 2) Helpers
 # ──────────────────────────────────────────────────────────────
-MONTH_PATTERN = re.compile(r"([A-Za-z]{3}-\d{4})\.csv$")
+MONTH_PATTERN = re.compile(r"([A-Za-z]{3}-\d{4})\.csv$")  # e.g. "Sep-2025"
 
 def extract_month_str(fname: str) -> str:
     m = MONTH_PATTERN.search(str(fname).strip())
@@ -43,7 +44,7 @@ def parse_month_to_date(mmm_yyyy: str) -> datetime:
 
 @st.cache_resource
 def get_status():
-    return {"app_start": datetime.now(timezone.utc), "last_refresh": None, "version": "v2"}
+    return {"app_start": datetime.now(timezone.utc), "last_refresh": None, "version": "v3"}
 
 def fmt_dt(dt_utc):
     if not dt_utc:
@@ -67,6 +68,8 @@ def human_delta(td: timedelta):
 def load_index() -> pd.DataFrame:
     url = RAW_BASE + "index.csv"
     idx = pd.read_csv(url)
+    if "file" not in idx.columns:
+        raise ValueError("index.csv must contain a 'file' column")
     files = [str(x).strip() for x in idx["file"].dropna().tolist()]
     rows = []
     for f in files:
@@ -76,7 +79,6 @@ def load_index() -> pd.DataFrame:
     meta = pd.DataFrame(rows).sort_values("month_date").reset_index(drop=True)
     return meta
 
-# Columns we care about (CareLink varies slightly by export)
 GLUCOSE_CANDIDATES = [
     "Sensor Glucose (mmol/L)",
     "Sensor Glucose (mg/dL)",
@@ -87,34 +89,27 @@ DATE_COL = "Date"
 TIME_COL = "Time"
 
 def _find_timeseries_header_row(url: str) -> int:
-    """
-    Scan the first ~200 lines to find the header of the time-series/events table.
-    Prefer a row that begins with 'Index,Date,Time' and also contains a glucose column.
-    """
+    # Scan first 200 lines to locate the time-series header
     sample = pd.read_csv(
         url, header=None, sep=",", engine="python",
         nrows=200, on_bad_lines="skip", encoding="utf-8-sig"
     )
-
-    # First pass: exact "Index,Date,Time" AND a glucose candidate present
+    # Best: exact "Index,Date,Time" + a glucose column
     for i, row in sample.iterrows():
         cells = [str(x).strip() for x in row.tolist()]
         if len(cells) >= 3 and cells[0] == "Index" and cells[1] == "Date" and cells[2] == "Time":
             if any(g in cells for g in GLUCOSE_CANDIDATES):
                 return i
-
-    # Second pass: any row containing Date + Time + a glucose column
+    # Next best: any row with Date + Time + a glucose column
     for i, row in sample.iterrows():
         cells = [str(x).strip() for x in row.tolist()]
         if DATE_COL in cells and TIME_COL in cells and any(g in cells for g in GLUCOSE_CANDIDATES):
             return i
-
-    # Fallback: densest row (most non-nulls)
+    # Fallback: densest row
     return sample.count(axis=1).idxmax()
 
 @st.cache_data(ttl=3600)
 def load_month_csv(filename: str) -> pd.DataFrame:
-    """Robust loader for CareLink multi-section CSVs → returns time-series rows."""
     clean = str(filename).strip()
     url = RAW_BASE + quote(clean)
     if DEBUG: st.code(f"Fetching: {url}")
@@ -125,30 +120,31 @@ def load_month_csv(filename: str) -> pd.DataFrame:
         url, sep=",", engine="python", header=header_row,
         on_bad_lines="skip", encoding="utf-8-sig", quotechar='"'
     )
-    # Drop completely empty columns, trim names
+    # Tidy columns
     df = df.dropna(axis=1, how="all")
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Keep only rows that look like real time entries: Date & Time present
+    # Keep rows that look like time entries
     if DATE_COL in df.columns and TIME_COL in df.columns:
         df = df[df[DATE_COL].notna() & df[TIME_COL].notna()]
 
-    # Add month label
+    # Month label
     df["month"] = extract_month_str(clean)
 
-    # Build a proper datetime column (AEST)
+    # Datetime (AEST)
     try:
-        # Some exports: Date = 29/09/2025, Time = 21:30:05
-        dt = pd.to_datetime(df[DATE_COL].astype(str) + " " + df[TIME_COL].astype(str), errors="coerce", dayfirst=True)
+        dt = pd.to_datetime(
+            df[DATE_COL].astype(str) + " " + df[TIME_COL].astype(str),
+            errors="coerce", dayfirst=True
+        )
         df["dt"] = dt.dt.tz_localize(SYD_TZ, nonexistent="NaT", ambiguous="NaT")
     except Exception:
         df["dt"] = pd.NaT
 
     if DEBUG:
         st.write(f"Header row detected: {header_row}")
-        st.write("Columns:", list(df.columns)[:14])
+        st.write("Columns (first 14):", list(df.columns)[:14])
         st.dataframe(df.head(12))
-
     return df
 
 @st.cache_data(ttl=3600)
@@ -239,24 +235,21 @@ st.subheader("Raw preview (first 200 rows)")
 st.dataframe(data.head(200), use_container_width=True)
 
 # ──────────────────────────────────────────────────────────────
-# 7) Minimal analysis scaffolding (will improve once columns confirmed)
+# 7) Minimal analysis scaffolding
 # ──────────────────────────────────────────────────────────────
 if not data.empty:
-    # Choose the first glucose column we can find
-    glucose_col = next((g for g in GLUCOSE_CANDIDATES if g in data.columns), None)
+    GLU = next((g for g in GLUCOSE_CANDIDATES if g in data.columns), None)
 
-    # Rows per month
     counts = data.groupby("month", as_index=False).size().rename(columns={"size": "rows"})
     counts = counts.merge(meta[["month"]], on="month", how="right")
     st.write("Rows per month")
     st.bar_chart(counts.set_index("month")["rows"])
 
-    # Quick monthly mean if a glucose column exists
-    if glucose_col:
-        st.write(f"Monthly mean of **{glucose_col}**")
-        means = data.groupby("month", as_index=False)[glucose_col].mean(numeric_only=True)
+    if GLU:
+        st.write(f"Monthly mean of **{GLU}**")
+        means = data.groupby("month", as_index=False)[GLU].mean(numeric_only=True)
         means = means.merge(meta[["month"]], on="month", how="right")
-        st.line_chart(means.set_index("month")[glucose_col])
+        st.line_chart(means.set_index("month")[GLU])
     else:
         st.caption("Glucose column not found yet — once we confirm the exact header name, I’ll wire proper charts.")
 else:
