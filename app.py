@@ -119,7 +119,7 @@ def load_month_csv(filename: str) -> pd.DataFrame:
     df = None
     for opts in attempts:
         try:
-            df = pd.read_csv(url, **opts)
+            df = pd.read_csv(url, on_bad_lines="skip", **opts)
             # if only one unnamed column, delimiter guess failed
             if df.shape[1] == 1 or all(str(c).startswith("Unnamed") for c in df.columns):
                 raise ValueError("Likely wrong delimiter or header")
@@ -161,6 +161,10 @@ def load_all_months(meta: pd.DataFrame) -> pd.DataFrame:
     all_df = pd.concat(frames, ignore_index=True)
     get_status()["last_data_refresh"] = datetime.now(timezone.utc)
     return all_df
+
+st.write("Detected delimiter:", opts.get("sep"))
+st.write("Columns detected:", list(df.columns))
+st.dataframe(df.head(10))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 4) Sidebar — status + month selector
